@@ -355,22 +355,29 @@ def is_silent(wav_path: Path) -> bool:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def load_whisper_model(model_name: str):
-    """Загружает модель Whisper с CUDA."""
+    """Загружает модель Whisper с CUDA (без повторного скачивания)."""
     global WhisperModel
     if WhisperModel is None:
         from faster_whisper import WhisperModel as WM
         WhisperModel = WM
 
-    log(f"🤖 Загрузка модели {model_name} (CUDA float16)...")
+    models_dir = CACHE_DIR / "models"
+    models_dir.mkdir(parents=True, exist_ok=True)
 
-    # RTX 4060: 8GB VRAM — large-v3 влезает в float16
+    # Проверяем, есть ли модель локально
+    local_model = models_dir / f"models--Systran--faster-whisper-{model_name}"
+    if local_model.exists():
+        log(f"🤖 Загрузка модели {model_name} (локальная, CUDA float16)...")
+    else:
+        log(f"🤖 Скачивание и загрузка модели {model_name} (CUDA float16)...")
+
     return WhisperModel(
         model_name,
         device="cuda",
         compute_type="float16",
-        download_root=str(CACHE_DIR / "models")
+        download_root=str(models_dir),
+        local_files_only=local_model.exists()  # не лезть в сеть, если модель есть
     )
-
 
 def transcribe(model, audio_path: Path, language: str = "ru", show_progress: bool = True) -> list[dict]:
     """Транскрибирует аудио с word-level timestamps и прогрессом."""
@@ -854,17 +861,35 @@ def main():
     parser.add_argument("-t", "--tracks", help="Дорожки для видео (например: 0,2,4)")
     parser.add_argument("--beep", action="store_true", help="Бип вместо тишины")
     parser.add_argument("--info", action="store_true", help="Показать дорожки")
-    parser.add_argument("--clear-cache", action="store_true", help="Очистить кеш")
+    parser.add_argument("--clear-cache", action="store_true", help="Очистить кеш (без моделей)")
+    parser.add_argument("--clear-models", action="store_true", help="Очистить скачанные модели")
 
     args = parser.parse_args()
 
-    # Очистка кеша
+    # Очистка кеша (без моделей)
     if args.clear_cache:
         if CACHE_DIR.exists():
-            shutil.rmtree(CACHE_DIR)
-            print(f"🗑️  Кеш очищен: {CACHE_DIR}")
+            models_dir = CACHE_DIR / "models"
+            for item in CACHE_DIR.iterdir():
+                if item == models_dir:
+                    continue
+                if item.is_dir():
+                    shutil.rmtree(item)
+                else:
+                    item.unlink()
+            print(f"🗑️  Кеш очищен (модели сохранены): {CACHE_DIR}")
         else:
             print("Кеш пуст")
+        return
+
+    # Очистка моделей
+    if args.clear_models:
+        models_dir = CACHE_DIR / "models"
+        if models_dir.exists():
+            shutil.rmtree(models_dir)
+            print(f"🗑️  Модели удалены: {models_dir}")
+        else:
+            print("Модели не найдены")
         return
 
     if not args.input:
