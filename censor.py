@@ -1,51 +1,86 @@
 #!/usr/bin/env python3
 """
-Быстрая цензура мата в видео c GPU-ускорением (RTX 4060).
+Автоматическая цензура мата в видео/аудио с faster-whisper + ffmpeg.
 
-Использует faster-whisper (CTranslate2) для транскрипции —
-примерно в 4-6 раз быстрее стандартного Whisper.
+Принимает любой медиафайл (определение типа через ffprobe, без привязки
+к расширениям). Для видео с несколькими аудиодорожками — интерактивный
+выбор в терминале. Сохраняет оригинальное качество аудио (автодетект
+битрейта). Выводит зацензурированное видео + отдельные обработанные
+аудиодорожки.
 
-Зависимости:
-    pip install faster-whisper numpy soundfile --break-system-packages
-    # ffmpeg должен быть в PATH
-
-Использование:
-    python censor.py video.mkv
-    python censor.py video.mkv --model large-v3
-    python censor.py video.mkv --tracks 0,2
-    python censor.py video.mkv --beep          # бип вместо тишины
-    python censor.py video.mkv --info          # показать дорожки
+Особенности:
+- Edge-preserve цензура: по умолчанию глушится центр слова, края остаются.
+- Режим --hard: отключает edge-preserve и использует более широкий паддинг.
+- Автодетект типа медиа через ffprobe (не по расширению файла).
+- Автодетект и сохранение оригинального битрейта аудио.
+- Интерактивный выбор дорожек при нескольких аудиодорожках.
+- Экспорт отдельных обработанных аудиодорожек в оригинальном кодеке.
+- Структурная обратная связь по этапам [START]/[DONE]/[SKIP]/[ERROR].
+- Continue + summary на ошибках дорожек/файлов.
+- CPU fallback для Whisper, если CUDA недоступна.
+- JSON-отчет по запуску (--report-json).
 """
 
+from __future__ import annotations
+
 import argparse
+import glob
 import hashlib
 import json
+import os
+import re
+import shutil
 import subprocess
 import sys
-import shutil
-import re
-import numpy as np
+import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from dataclasses import dataclass
-from typing import Optional
-from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Optional
+
+import numpy as np
 
 # Ленивый импорт faster-whisper (для --info без загрузки модели)
 WhisperModel = None
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ============================================================================
 # НАСТРОЙКИ
-# ═══════════════════════════════════════════════════════════════════════════════
+# ============================================================================
 
-DEFAULT_MODEL = "medium"  # tiny, base, small, medium, large-v2, large-v3
+DEFAULT_MODEL = "medium"
+KNOWN_MODELS = frozenset(
+    {
+        "tiny",
+        "base",
+        "small",
+        "medium",
+        "large-v2",
+        "large-v3",
+        "large-v3-turbo",
+    }
+)
+
 SILENCE_THRESHOLD_DB = -50
 BEEP_FREQ = 1000  # Гц
-PADDING_MS = 50  # расширить цензуру на X мс с каждой стороны
 
-# Расширения файлов
-AUDIO_EXTENSIONS = {'.mp3', '.wav', '.flac', '.ogg', '.m4a', '.aac', '.wma', '.opus'}
-VIDEO_EXTENSIONS = {'.mkv', '.mp4', '.avi', '.mov', '.webm', '.ts', '.m2ts', '.wmv'}
+DEFAULT_PAD_MS = 25
+HARD_PAD_MS = 50
+DEFAULT_EDGE_KEEP_MS = 15
+DEFAULT_MIN_CENSOR_MS = 80
+MERGE_GAP_MS = 40
+
+# Расширения файлов (для совместимости и output-хинтов)
+AUDIO_EXTENSIONS = {".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac", ".wma", ".opus"}
+VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".mov", ".webm", ".ts", ".m2ts", ".wmv"}
+
+# Маппинг кодек → расширение для экспорта отдельных аудиодорожек
+CODEC_EXT_MAP = {
+    "aac": ".m4a", "mp3": ".mp3", "opus": ".opus", "vorbis": ".ogg",
+    "flac": ".flac", "ac3": ".ac3", "eac3": ".eac3", "dts": ".dts",
+    "pcm_s16le": ".wav", "pcm_f32le": ".wav", "wmav2": ".wma",
+}
 
 # Пути
 SCRIPT_DIR = Path(__file__).parent
@@ -53,10 +88,56 @@ SWEARS_FILE = SCRIPT_DIR / "swears.txt"
 SWEARS_FILE_ALT = Path.home() / ".config" / "censor" / "swears.txt"
 CACHE_DIR = SCRIPT_DIR / "cache"
 
+# Глобальные кеши и временные артефакты
+_duration_cache: dict[tuple[str, int, float], float] = {}
+_temp_files: set[Path] = set()
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# СТРУКТУРЫ ДАННЫХ
-# ═══════════════════════════════════════════════════════════════════════════════
+
+# ============================================================================
+# ОШИБКИ
+# ============================================================================
+
+
+class CensorErrorBase(Exception):
+    """Базовая ошибка пайплайна."""
+
+
+class DependencyError(CensorErrorBase):
+    """Нет внешней зависимости (ffmpeg/ffprobe)."""
+
+
+class ValidationError(CensorErrorBase):
+    """Ошибка валидации аргументов/ввода."""
+
+
+class ProbeError(CensorErrorBase):
+    """Ошибка ffprobe."""
+
+
+class ExtractError(CensorErrorBase):
+    """Ошибка извлечения/конвертации аудио."""
+
+
+class TranscriptionError(CensorErrorBase):
+    """Ошибка транскрипции."""
+
+
+class CensorApplyError(CensorErrorBase):
+    """Ошибка применения цензуры."""
+
+
+class EncodeError(CensorErrorBase):
+    """Ошибка кодирования/копирования аудио."""
+
+
+class AssembleError(CensorErrorBase):
+    """Ошибка сборки финального видео."""
+
+
+# ============================================================================
+# ТИПЫ ДАННЫХ
+# ============================================================================
+
 
 @dataclass
 class AudioTrack:
@@ -66,18 +147,86 @@ class AudioTrack:
     channels: int
     sample_rate: int
     title: str
+    bitrate: Optional[int] = None  # бит/с, например 192000
+
+
+@dataclass
+class Config:
+    model_name: str = DEFAULT_MODEL
+    use_beep: bool = False
+    pad_ms: int = DEFAULT_PAD_MS
+    edge_keep_ms: int = DEFAULT_EDGE_KEEP_MS
+    edge_keep_enabled: bool = True
+    min_censor_ms: int = DEFAULT_MIN_CENSOR_MS
+    track_filter: Optional[list[int]] = None
+    verbose: bool = False
+    language: str = "ru"
+    report_json_path: Optional[Path] = None
+
+
+@dataclass
+class WordToken:
+    word: str
+    start: float
+    end: float
+    probability: Optional[float] = None
 
 
 @dataclass
 class SwearMatch:
-    start: float  # секунды
-    end: float
     word: str
+    start: float
+    end: float
+    probability: Optional[float] = None
+    mute_start: float = 0.0
+    mute_end: float = 0.0
+    mode: str = "center"
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# УТИЛИТЫ
-# ═══════════════════════════════════════════════════════════════════════════════
+@dataclass
+class StageResult:
+    stage: str
+    ok: bool = True
+    duration_ms: float = 0.0
+    cache_hit: bool = False
+    skipped: bool = False
+    message: str = ""
+    error_code: str = ""
+
+
+@dataclass
+class TrackResult:
+    track_index: Optional[int]
+    title: str
+    status: str = "pending"  # ok|cached|failed|fallback_copy|copied
+    found_matches: int = 0
+    applied_intervals: int = 0
+    censored_words: int = 0
+    cache_hits: int = 0
+    output_path: str = ""
+    stages: list[StageResult] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+
+
+@dataclass
+class FileResult:
+    input_path: str
+    output_path: str
+    media_type: str
+    status: str = "pending"  # ok|partial_failed|failed
+    total_matches: int = 0
+    total_censored: int = 0
+    duration_ms: float = 0.0
+    tracks: list[TrackResult] = field(default_factory=list)
+    stages: list[StageResult] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+    exported_tracks: list[str] = field(default_factory=list)
+
+
+# ============================================================================
+# ЛОГГИНГ И ТАЙМИНГ
+# ============================================================================
+
 
 def log(msg: str, prefix: str = ""):
     print(f"{prefix}{msg}")
@@ -89,372 +238,890 @@ def print_progress(current: float, total: float, prefix: str = "", width: int = 
         return
     pct = min(current / total, 1.0)
     filled = int(width * pct)
-    bar = '█' * filled + '░' * (width - filled)
-    print(f"\r{prefix} [{bar}] {pct*100:.0f}%", end='', flush=True)
+    bar = "█" * filled + "░" * (width - filled)
+    print(f"\r{prefix} [{bar}] {pct*100:.0f}%", end="", flush=True)
     if current >= total:
         print()
 
 
+class StepTimer:
+    """Контекст тайминга и статуса этапа с автоматическим логом."""
+
+    def __init__(self, owner: Any, stage: str, prefix: str = "      "):
+        self.owner = owner
+        self.stage = stage
+        self.prefix = prefix
+        self.stage_result = StageResult(stage=stage)
+        self._start = 0.0
+
+    def __enter__(self):
+        print(f"{self.prefix}[START] {self.stage}")
+        self._start = time.monotonic()
+        return self
+
+    def skip(self, reason: str, cache_hit: bool = False):
+        self.stage_result.message = reason
+        self.stage_result.cache_hit = cache_hit
+        self.stage_result.skipped = True
+
+    def info(self, message: str):
+        self.stage_result.message = message
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.stage_result.duration_ms = (time.monotonic() - self._start) * 1000.0
+        if exc_val is not None:
+            self.stage_result.ok = False
+            self.stage_result.error_code = exc_type.__name__ if exc_type else "Error"
+            self.stage_result.message = str(exc_val)
+
+        self.owner.stages.append(self.stage_result)
+        if hasattr(self.owner, "cache_hits") and self.stage_result.cache_hit:
+            self.owner.cache_hits += 1
+
+        sec = self.stage_result.duration_ms / 1000.0
+        if self.stage_result.ok:
+            if self.stage_result.cache_hit:
+                print(f"{self.prefix}[SKIP cache] {self.stage} ({sec:.2f}s)")
+            elif self.stage_result.skipped:
+                print(
+                    f"{self.prefix}[SKIP {self.stage_result.message}] {self.stage} ({sec:.2f}s)"
+                )
+            else:
+                print(f"{self.prefix}[DONE {sec:.2f}s] {self.stage}")
+        else:
+            print(
+                f"{self.prefix}[ERROR {self.stage_result.error_code}] "
+                f"{self.stage}: {self.stage_result.message}"
+            )
+        return False
+
+
+def add_error(owner: Any, error: Exception | str):
+    owner.errors.append(str(error))
+
+
+# ============================================================================
+# УТИЛИТЫ
+# ============================================================================
+
+
+def register_temp_file(path: Path):
+    _temp_files.add(path)
+
+
+def cleanup_temp_files():
+    for f in list(_temp_files):
+        try:
+            f.unlink(missing_ok=True)
+        except OSError:
+            pass
+    _temp_files.clear()
+
+
 def is_audio_file(path: Path) -> bool:
-    """Проверяет, является ли файл аудиофайлом."""
     return path.suffix.lower() in AUDIO_EXTENSIONS
 
 
 def is_video_file(path: Path) -> bool:
-    """Проверяет, является ли файл видеофайлом."""
     return path.suffix.lower() in VIDEO_EXTENSIONS
 
 
-def get_audio_duration(path: Path) -> float:
-    """Получает длительность аудио в секундах."""
-    cmd = ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", str(path)]
-    result = run_cmd(cmd, capture=True)
-    if result.returncode != 0:
-        return 0
-    try:
-        info = json.loads(result.stdout)
-        return float(info.get("format", {}).get("duration", 0))
-    except (ValueError, KeyError):
-        return 0
-
-
-def run_cmd(cmd: list[str], capture: bool = False, quiet: bool = True) -> subprocess.CompletedProcess:
-    """Запуск команды с обработкой ошибок."""
+def run_cmd(
+    cmd: list[str], capture: bool = False, quiet: bool = True
+) -> subprocess.CompletedProcess:
+    """Запуск команды с единым поведением."""
     try:
         if capture:
             return subprocess.run(cmd, capture_output=True, text=True)
-        elif quiet:
-            return subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        else:
-            return subprocess.run(cmd)
-    except FileNotFoundError:
-        print(f"❌ Не найдена команда: {cmd[0]}")
-        sys.exit(1)
+        if quiet:
+            return subprocess.run(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+        return subprocess.run(cmd)
+    except FileNotFoundError as exc:
+        raise DependencyError(f"Не найдена команда: {cmd[0]}") from exc
 
 
 def run_ffmpeg_with_progress(cmd: list[str], duration: float, prefix: str = "") -> bool:
-    """Запускает ffmpeg с отображением прогресса."""
+    """Запуск ffmpeg с progress=pipe."""
     if duration <= 0:
-        # Без прогресса
         return run_cmd(cmd, quiet=True).returncode == 0
 
-    # Добавляем вывод прогресса
     cmd_with_progress = cmd.copy()
-    # Вставляем после ffmpeg и перед входным файлом
-    insert_pos = 1
-    cmd_with_progress.insert(insert_pos, "-progress")
-    cmd_with_progress.insert(insert_pos + 1, "pipe:1")
+    cmd_with_progress.insert(1, "-progress")
+    cmd_with_progress.insert(2, "pipe:1")
 
     try:
         process = subprocess.Popen(
             cmd_with_progress,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            text=True
+            text=True,
         )
+    except FileNotFoundError as exc:
+        raise DependencyError("Не найдена команда: ffmpeg") from exc
 
-        current_time = 0.0
-        for line in process.stdout:
-            line = line.strip()
-            if line.startswith("out_time_ms="):
-                try:
-                    time_ms = int(line.split("=")[1])
-                    current_time = time_ms / 1_000_000  # микросекунды в секунды
-                    print_progress(current_time, duration, prefix)
-                except ValueError:
-                    pass
-            elif line == "progress=end":
-                print_progress(duration, duration, prefix)
+    current_time = 0.0
+    assert process.stdout is not None
+    for line in process.stdout:
+        line = line.strip()
+        if line.startswith("out_time_ms="):
+            try:
+                time_us = int(line.split("=")[1])
+            except ValueError:
+                continue
+            current_time = time_us / 1_000_000
+            print_progress(current_time, duration, prefix)
+        elif line == "progress=end":
+            print_progress(duration, duration, prefix)
 
-        process.wait()
-        return process.returncode == 0
+    process.wait()
+    return process.returncode == 0
 
-    except FileNotFoundError:
-        print(f"❌ Не найдена команда: ffmpeg")
-        return False
+
+def check_dependencies():
+    missing = [tool for tool in ("ffmpeg", "ffprobe") if shutil.which(tool) is None]
+    if missing:
+        raise DependencyError(f"Отсутствуют зависимости в PATH: {', '.join(missing)}")
+
+
+def check_model_name(model_name: str):
+    if model_name not in KNOWN_MODELS:
+        print(f"⚠️  Неизвестная модель '{model_name}'. Продолжаем попытку загрузки.")
 
 
 def get_file_hash(path: Path) -> str:
-    """Быстрый хеш по метаданным файла."""
     stat = path.stat()
     data = f"{path.name}_{stat.st_size}_{stat.st_mtime}"
     return hashlib.md5(data.encode()).hexdigest()[:10]
 
 
 def get_cache_dir(input_file: Path) -> Path:
-    """Папка кеша для файла."""
     h = get_file_hash(input_file)
     cache = CACHE_DIR / f"{input_file.stem}_{h}"
     cache.mkdir(parents=True, exist_ok=True)
     return cache
 
 
+def compute_swears_hash(swears: set[str]) -> str:
+    data = "\n".join(sorted(swears)).encode("utf-8")
+    return hashlib.md5(data).hexdigest()[:10]
+
+
+def compute_config_signature(config: Config, swears_hash: str) -> str:
+    payload = {
+        "model": config.model_name,
+        "beep": config.use_beep,
+        "pad_ms": config.pad_ms,
+        "edge_keep_ms": config.edge_keep_ms,
+        "edge_keep_enabled": config.edge_keep_enabled,
+        "min_censor_ms": config.min_censor_ms,
+        "language": config.language,
+        "swears": swears_hash,
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.md5(raw).hexdigest()[:10]
+
+
+def get_processing_cache_dir(
+    input_file: Path, config: Config, swears_hash: str
+) -> Path:
+    base = get_cache_dir(input_file)
+    signature = compute_config_signature(config, swears_hash)
+    run_dir = base / f"run_{signature}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
+
+
+def get_duration_key(path: Path) -> tuple[str, int, float]:
+    stat = path.stat()
+    return str(path.resolve()), stat.st_size, stat.st_mtime
+
+
+def get_audio_duration_raw(path: Path) -> float:
+    cmd = ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", str(path)]
+    result = run_cmd(cmd, capture=True)
+    if result.returncode != 0:
+        return 0.0
+    try:
+        info = json.loads(result.stdout)
+        return float(info.get("format", {}).get("duration", 0.0))
+    except (ValueError, KeyError, TypeError):
+        return 0.0
+
+
+def get_audio_duration(path: Path) -> float:
+    key = get_duration_key(path)
+    if key not in _duration_cache:
+        _duration_cache[key] = get_audio_duration_raw(path)
+    return _duration_cache[key]
+
+
+def verify_output(path: Path, label: str):
+    if not path.exists() or path.stat().st_size <= 0:
+        raise RuntimeError(f"{label}: пустой или отсутствующий файл: {path}")
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-print_format",
+        "json",
+        "-show_streams",
+        str(path),
+    ]
+    result = run_cmd(cmd, capture=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"{label}: ffprobe не смог прочитать файл: {path}")
+
+
+def check_disk_space(path: Path, required_bytes: int):
+    free = shutil.disk_usage(path.parent).free
+    if free < required_bytes:
+        print(
+            f"⚠️  Мало места: свободно {free/1e9:.2f} GB, "
+            f"ориентировочно нужно ~{required_bytes/1e9:.2f} GB"
+        )
+
+
+def estimate_wav_bytes(duration_s: float, sample_rate: int, channels: int) -> int:
+    return int(duration_s * max(sample_rate, 1) * max(channels, 1) * 4 * 1.2)
+
+
 def load_swears() -> set[str]:
-    """Загружает список мата."""
     swears_file = SWEARS_FILE if SWEARS_FILE.exists() else SWEARS_FILE_ALT
-
     if not swears_file.exists():
-        print(f"❌ Файл swears.txt не найден!")
-        print(f"   Ожидаемые пути:")
-        print(f"   - {SWEARS_FILE}")
-        print(f"   - {SWEARS_FILE_ALT}")
-        sys.exit(1)
+        raise ValidationError(
+            "Файл swears.txt не найден. " f"Пути: {SWEARS_FILE} или {SWEARS_FILE_ALT}"
+        )
 
-    swears = set()
+    swears: set[str] = set()
     for line in swears_file.read_text(encoding="utf-8").splitlines():
         word = line.strip().lower()
         if word and not word.startswith("#"):
             swears.add(word)
 
+    if not swears:
+        raise ValidationError("Словарь swears.txt пуст.")
+
     log(f"📝 Загружено {len(swears)} слов из {swears_file.name}")
     return swears
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# РАБОТА С ВИДЕО/АУДИО
-# ═══════════════════════════════════════════════════════════════════════════════
+def build_swear_matcher(swears: set[str]) -> re.Pattern[str]:
+    patterns = [re.escape(w) for w in sorted(swears, key=len, reverse=True)]
+    return re.compile(r"\b(" + "|".join(patterns) + r")[а-яёa-z]*\b", re.IGNORECASE)
+
+
+def parse_track_filter(raw: Optional[str]) -> Optional[list[int]]:
+    if not raw:
+        return None
+    out: list[int] = []
+    for part in raw.split(","):
+        p = part.strip()
+        if not p:
+            continue
+        if not p.isdigit():
+            raise ValidationError(f"Некорректный индекс дорожки: '{p}'")
+        idx = int(p)
+        if idx < 0:
+            raise ValidationError("Индекс дорожки не может быть отрицательным")
+        out.append(idx)
+    if not out:
+        raise ValidationError("Пустой список в --tracks")
+    return sorted(set(out))
+
+
+def interactive_track_selection(tracks: list[AudioTrack]) -> set[int]:
+    """Интерактивный выбор аудиодорожек в терминале.
+
+    Показывает нумерованный список с параметрами каждой дорожки (кодек,
+    каналы, sample rate, битрейт). Пользователь вводит номера через запятую,
+    'all', или Enter для обработки всех дорожек.
+    """
+    available = {t.audio_index for t in tracks}
+
+    print("\n📊 Доступные аудиодорожки:")
+    for t in tracks:
+        br = f", {format_bitrate(t.bitrate)}" if t.bitrate else ""
+        print(
+            f"   [{t.audio_index}] {t.title} "
+            f"({t.codec}, {t.channels}ch, {t.sample_rate}Hz{br})"
+        )
+    print("\nВведите номера дорожек через запятую (например: 0,2)")
+    print("  'all' или Enter — обработать все")
+
+    while True:
+        try:
+            raw = input("\n> ").strip().lower()
+        except EOFError:
+            return available
+
+        if raw in ("", "all"):
+            return available
+
+        try:
+            indices: set[int] = set()
+            for part in raw.split(","):
+                p = part.strip()
+                if not p:
+                    continue
+                if not p.isdigit():
+                    raise ValueError(f"'{p}' — не число")
+                idx = int(p)
+                if idx not in available:
+                    raise ValueError(
+                        f"дорожка {idx} не найдена "
+                        f"(доступны: {sorted(available)})"
+                    )
+                indices.add(idx)
+            if not indices:
+                raise ValueError("пустой выбор")
+            return indices
+        except ValueError as exc:
+            print(f"  ⚠️  Ошибка: {exc}. Попробуйте ещё раз.")
+
+
+def export_separate_tracks(
+    tracks: list[AudioTrack],
+    processed_paths: dict[int, Path],
+    selected: set[int],
+    output_dir: Path,
+    video_stem: str,
+) -> list[Path]:
+    """Экспортирует обработанные аудиодорожки в отдельные файлы.
+
+    Для каждой обработанной дорожки выполняет ремукс из .mka в контейнер,
+    соответствующий оригинальному кодеку (AAC → .m4a, AC3 → .ac3 и т.д.).
+    Использует ffmpeg -c:a copy (без перекодирования).
+
+    Returns:
+        Список путей к экспортированным файлам.
+    """
+    exported: list[Path] = []
+    for t in tracks:
+        if t.audio_index not in selected:
+            continue
+        mka_path = processed_paths.get(t.audio_index)
+        if not mka_path or not mka_path.exists():
+            continue
+
+        ext = CODEC_EXT_MAP.get(t.codec, ".mka")
+        out_name = f"{video_stem}_censored_track{t.audio_index}{ext}"
+        out_path = output_dir / out_name
+
+        cmd = [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-i", str(mka_path), "-c:a", "copy", str(out_path),
+        ]
+        ok = run_cmd(cmd, quiet=True).returncode == 0
+        if ok and out_path.exists():
+            exported.append(out_path)
+        else:
+            print(f"      ⚠️  Не удалось экспортировать дорожку {t.audio_index}")
+    return exported
+
+
+def get_output_path(input_path: Path, custom_output: Optional[str]) -> Path:
+    if custom_output:
+        return Path(custom_output).resolve()
+    return input_path.parent / f"{input_path.stem}_censored{input_path.suffix}"
+
+
+def jsonable(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {k: jsonable(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [jsonable(v) for v in value]
+    return value
+
+
+# ============================================================================
+# ПРОБЫ И МЕДИА
+# ============================================================================
+
+
+def probe_media_type(input_file: Path) -> str:
+    """Определяет тип медиафайла через ffprobe.
+
+    Анализирует потоки файла: если есть видеопоток (не обложка) — "video",
+    если только аудио — "audio". Позволяет принимать любой формат файла.
+
+    Returns:
+        "video" или "audio"
+
+    Raises:
+        ValidationError: если файл не содержит ни видео, ни аудио потоков.
+    """
+    cmd = [
+        "ffprobe", "-v", "quiet", "-print_format", "json",
+        "-show_streams", str(input_file),
+    ]
+    result = run_cmd(cmd, capture=True)
+    if result.returncode != 0:
+        raise ValidationError(f"ffprobe не смог прочитать файл: {input_file}")
+
+    try:
+        info = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise ValidationError(f"Некорректный ответ ffprobe: {input_file}") from exc
+
+    has_video = False
+    has_audio = False
+    for stream in info.get("streams", []):
+        codec_type = stream.get("codec_type")
+        if codec_type == "video":
+            # Пропускаем обложки (attached pictures) — они не являются видеопотоком
+            disposition = stream.get("disposition", {})
+            if disposition.get("attached_pic", 0) == 1:
+                continue
+            codec_name = stream.get("codec_name", "")
+            if codec_name in ("mjpeg", "png", "bmp"):
+                continue
+            has_video = True
+        elif codec_type == "audio":
+            has_audio = True
+
+    if has_video:
+        return "video"
+    if has_audio:
+        return "audio"
+    raise ValidationError(f"Файл не содержит видео или аудио потоков: {input_file}")
+
 
 def get_audio_tracks(input_file: Path) -> list[AudioTrack]:
-    """Получает список аудиодорожек."""
-    cmd = ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", str(input_file)]
+    """Извлекает список аудиодорожек из видеофайла через ffprobe.
+
+    Парсит bit_rate каждого потока для сохранения оригинального качества
+    при перекодировании.
+    """
+    cmd = [
+        "ffprobe",
+        "-v",
+        "quiet",
+        "-print_format",
+        "json",
+        "-show_streams",
+        str(input_file),
+    ]
     result = run_cmd(cmd, capture=True)
-
     if result.returncode != 0:
-        print("❌ Ошибка ffprobe")
-        sys.exit(1)
+        raise ProbeError(f"ffprobe ошибка для {input_file}")
 
-    info = json.loads(result.stdout)
-    tracks = []
+    try:
+        info = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise ProbeError(f"Некорректный JSON ffprobe для {input_file}") from exc
+
+    tracks: list[AudioTrack] = []
     audio_idx = 0
-
     for stream in info.get("streams", []):
         if stream.get("codec_type") == "audio":
-            tracks.append(AudioTrack(
-                stream_index=stream.get("index", 0),
-                audio_index=audio_idx,
-                codec=stream.get("codec_name", "aac"),
-                channels=stream.get("channels", 2),
-                sample_rate=int(stream.get("sample_rate", 48000)),
-                title=stream.get("tags", {}).get("title", f"Track {audio_idx}")
-            ))
+            raw_br = stream.get("bit_rate")
+            bitrate = int(raw_br) if raw_br else None
+            tracks.append(
+                AudioTrack(
+                    stream_index=stream.get("index", 0),
+                    audio_index=audio_idx,
+                    codec=stream.get("codec_name", "aac"),
+                    channels=stream.get("channels", 2),
+                    sample_rate=int(stream.get("sample_rate", 48000)),
+                    title=stream.get("tags", {}).get("title", f"Track {audio_idx}"),
+                    bitrate=bitrate,
+                )
+            )
             audio_idx += 1
-
     return tracks
 
 
 def get_audio_info(input_file: Path) -> Optional[AudioTrack]:
-    """Получает информацию об аудиофайле (для чистых аудио без видео)."""
-    cmd = ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", "-show_format", str(input_file)]
-    result = run_cmd(cmd, capture=True)
+    """Извлекает информацию об аудиофайле (кодек, каналы, sample rate, битрейт).
 
+    Для битрейта сначала проверяет stream.bit_rate, затем format.bit_rate
+    как fallback (для форматов, где битрейт указан только на уровне контейнера).
+    """
+    cmd = [
+        "ffprobe",
+        "-v",
+        "quiet",
+        "-print_format",
+        "json",
+        "-show_streams",
+        "-show_format",
+        str(input_file),
+    ]
+    result = run_cmd(cmd, capture=True)
     if result.returncode != 0:
         return None
-
     try:
         info = json.loads(result.stdout)
-    except (ValueError, KeyError):
+    except json.JSONDecodeError:
         return None
 
+    format_br = info.get("format", {}).get("bit_rate")
     for stream in info.get("streams", []):
         if stream.get("codec_type") == "audio":
+            raw_br = stream.get("bit_rate") or format_br
+            bitrate = int(raw_br) if raw_br else None
             return AudioTrack(
                 stream_index=stream.get("index", 0),
                 audio_index=0,
                 codec=stream.get("codec_name", "mp3"),
                 channels=stream.get("channels", 2),
                 sample_rate=int(stream.get("sample_rate", 44100)),
-                title=input_file.stem
+                title=input_file.stem,
+                bitrate=bitrate,
             )
-
     return None
 
 
-def convert_audio_for_whisper(input_file: Path, output_wav: Path,
-                               show_progress: bool = False, prefix: str = "") -> bool:
-    """Конвертирует любой аудиофайл в WAV для Whisper (16kHz mono)."""
+def to_whisper_wav(
+    src: Path,
+    dst: Path,
+    audio_index: Optional[int] = None,
+    show_progress: bool = False,
+    prefix: str = "",
+) -> bool:
+    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(src)]
+    if audio_index is not None:
+        cmd.extend(["-map", f"0:a:{audio_index}"])
+    cmd.extend(["-ac", "1", "-ar", "16000", "-acodec", "pcm_s16le", str(dst)])
+    if show_progress:
+        duration = get_audio_duration(src)
+        ok = run_ffmpeg_with_progress(cmd, duration, prefix)
+    else:
+        ok = run_cmd(cmd, quiet=True).returncode == 0
+    if ok:
+        verify_output(dst, "to_whisper_wav")
+    return ok
+
+
+def to_full_wav(
+    src: Path,
+    dst: Path,
+    audio_index: Optional[int] = None,
+    show_progress: bool = False,
+    prefix: str = "",
+) -> bool:
+    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(src)]
+    if audio_index is not None:
+        cmd.extend(["-map", f"0:a:{audio_index}"])
+    cmd.extend(["-acodec", "pcm_f32le", str(dst)])
+    if show_progress:
+        duration = get_audio_duration(src)
+        ok = run_ffmpeg_with_progress(cmd, duration, prefix)
+    else:
+        ok = run_cmd(cmd, quiet=True).returncode == 0
+    if ok:
+        verify_output(dst, "to_full_wav")
+    return ok
+
+
+def copy_audio_source(src: Path, output: Path, audio_index: Optional[int]) -> bool:
+    if audio_index is None:
+        shutil.copy2(src, output)
+        verify_output(output, "copy_audio_source")
+        return True
+
     cmd = [
-        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-        "-i", str(input_file),
-        "-ac", "1",           # моно
-        "-ar", "16000",       # 16kHz
-        "-acodec", "pcm_s16le",
-        str(output_wav)
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(src),
+        "-map",
+        f"0:a:{audio_index}",
+        "-c:a",
+        "copy",
+        str(output),
+    ]
+    ok = run_cmd(cmd, quiet=True).returncode == 0
+    if ok:
+        verify_output(output, "copy_audio_source(track)")
+    return ok
+
+
+def encode_audio(
+    input_wav: Path,
+    output_file: Path,
+    track: AudioTrack,
+    show_progress: bool = False,
+    prefix: str = "",
+) -> bool:
+    """Кодирует WAV обратно в оригинальный кодек.
+
+    Битрейт определяется автоматически из метаданных трека (track.bitrate).
+    Если оригинальный битрейт недоступен — используются разумные дефолты.
+    """
+    fallback_bitrate = {
+        "aac": "192k", "mp3": "192k", "opus": "128k",
+        "vorbis": "192k", "ac3": "384k", "eac3": "384k", "dts": "768k",
+    }
+    if track.bitrate and track.bitrate > 0:
+        br = f"{track.bitrate // 1000}k"
+    else:
+        br = fallback_bitrate.get(track.codec, "192k")
+
+    codec_map = {
+        "aac": ["-c:a", "aac", "-b:a", br],
+        "mp3": ["-c:a", "libmp3lame", "-b:a", br],
+        "opus": ["-c:a", "libopus", "-b:a", br],
+        "vorbis": ["-c:a", "libvorbis", "-b:a", br],
+        "flac": ["-c:a", "flac"],
+        "ac3": ["-c:a", "ac3", "-b:a", br],
+        "eac3": ["-c:a", "eac3", "-b:a", br],
+        "dts": ["-c:a", "dca", "-b:a", br],
+    }
+    codec_args = codec_map.get(track.codec, ["-c:a", "aac", "-b:a", br])
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(input_wav),
+        "-ar",
+        str(track.sample_rate),
+        "-ac",
+        str(track.channels),
+        *codec_args,
+        str(output_file),
     ]
     if show_progress:
-        duration = get_audio_duration(input_file)
-        return run_ffmpeg_with_progress(cmd, duration, prefix)
-    return run_cmd(cmd, quiet=True).returncode == 0
+        duration = get_audio_duration(input_wav)
+        ok = run_ffmpeg_with_progress(cmd, duration, prefix)
+    else:
+        ok = run_cmd(cmd, quiet=True).returncode == 0
+    if ok:
+        verify_output(output_file, "encode_audio")
+    return ok
 
 
-def convert_audio_full(input_file: Path, output_wav: Path,
-                       show_progress: bool = False, prefix: str = "") -> bool:
-    """Конвертирует аудиофайл в WAV с полным качеством."""
+def assemble_video(
+    input_file: Path,
+    audio_files: list[Path],
+    output_file: Path,
+    tracks: list[AudioTrack],
+) -> bool:
     cmd = [
-        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-        "-i", str(input_file),
-        "-acodec", "pcm_f32le",
-        str(output_wav)
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "warning",
+        "-stats",
+        "-i",
+        str(input_file),
     ]
-    if show_progress:
-        duration = get_audio_duration(input_file)
-        return run_ffmpeg_with_progress(cmd, duration, prefix)
-    return run_cmd(cmd, quiet=True).returncode == 0
+    for audio in audio_files:
+        cmd.extend(["-i", str(audio)])
 
+    cmd.extend(["-map", "0:v?"])
+    for i in range(len(audio_files)):
+        cmd.extend(["-map", f"{i+1}:a:0"])
+    cmd.extend(["-map", "0:s?"])
+    cmd.extend(["-c:v", "copy", "-c:s", "copy", "-c:a", "copy"])
 
-def extract_audio(input_file: Path, track: AudioTrack, output_wav: Path,
-                  show_progress: bool = False, prefix: str = "") -> bool:
-    """Извлекает аудиодорожку в WAV (оптимизировано для Whisper)."""
-    cmd = [
-        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-        "-i", str(input_file),
-        "-map", f"0:a:{track.audio_index}",
-        "-ac", "1",           # моно (Whisper работает с моно)
-        "-ar", "16000",       # 16kHz (оптимально для Whisper)
-        "-acodec", "pcm_s16le",
-        str(output_wav)
-    ]
-    if show_progress:
-        duration = get_audio_duration(input_file)
-        return run_ffmpeg_with_progress(cmd, duration, prefix)
-    return run_cmd(cmd, quiet=True).returncode == 0
+    for i, track in enumerate(tracks):
+        if track.title:
+            cmd.extend([f"-metadata:s:a:{i}", f"title={track.title}"])
 
-
-def extract_audio_full(input_file: Path, track: AudioTrack, output_wav: Path,
-                       show_progress: bool = False, prefix: str = "") -> bool:
-    """Извлекает полное качество для обработки."""
-    cmd = [
-        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-        "-i", str(input_file),
-        "-map", f"0:a:{track.audio_index}",
-        "-acodec", "pcm_f32le",  # float32 для точной обработки
-        str(output_wav)
-    ]
-    if show_progress:
-        duration = get_audio_duration(input_file)
-        return run_ffmpeg_with_progress(cmd, duration, prefix)
-    return run_cmd(cmd, quiet=True).returncode == 0
+    cmd.append(str(output_file))
+    ok = run_cmd(cmd, quiet=False).returncode == 0
+    if ok:
+        verify_output(output_file, "assemble_video")
+    return ok
 
 
 def is_silent(wav_path: Path) -> bool:
-    """Проверяет, тихая ли дорожка."""
     cmd = ["ffmpeg", "-i", str(wav_path), "-af", "volumedetect", "-f", "null", "-"]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-
-    for line in result.stderr.split('\n'):
-        if 'max_volume' in line:
+    result = run_cmd(cmd, capture=True)
+    for line in result.stderr.split("\n"):
+        if "max_volume" in line:
             try:
-                max_vol = float(line.split('max_volume:')[1].split('dB')[0].strip())
+                max_vol = float(line.split("max_volume:")[1].split("dB")[0].strip())
                 return max_vol < SILENCE_THRESHOLD_DB
-            except:
+            except (ValueError, IndexError):
                 pass
     return False
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# ТРАНСКРИПЦИЯ (FASTER-WHISPER)
-# ═══════════════════════════════════════════════════════════════════════════════
+# ============================================================================
+# WHISPER
+# ============================================================================
+
 
 def load_whisper_model(model_name: str):
-    """Загружает модель Whisper с CUDA (без повторного скачивания)."""
     global WhisperModel
     if WhisperModel is None:
         from faster_whisper import WhisperModel as WM
+
         WhisperModel = WM
 
     models_dir = CACHE_DIR / "models"
     models_dir.mkdir(parents=True, exist_ok=True)
-
-    # Проверяем, есть ли модель локально
     local_model = models_dir / f"models--Systran--faster-whisper-{model_name}"
-    if local_model.exists():
-        log(f"🤖 Загрузка модели {model_name} (локальная, CUDA float16)...")
-    else:
-        log(f"🤖 Скачивание и загрузка модели {model_name} (CUDA float16)...")
+    local_files_only = local_model.exists()
 
-    return WhisperModel(
-        model_name,
-        device="cuda",
-        compute_type="float16",
-        download_root=str(models_dir),
-        local_files_only=local_model.exists()  # не лезть в сеть, если модель есть
-    )
+    attempts = [("cuda", "float16"), ("cpu", "int8")]
+    last_error: Optional[Exception] = None
+    for device, compute_type in attempts:
+        try:
+            if device == "cuda":
+                log(f"🤖 Загрузка модели {model_name} (CUDA {compute_type})...")
+            else:
+                log(f"⚠️  CUDA недоступна. Фолбек на CPU ({compute_type})...")
 
-def transcribe(model, audio_path: Path, language: str = "ru", show_progress: bool = True) -> list[dict]:
-    """Транскрибирует аудио с word-level timestamps и прогрессом."""
-    # Получаем длительность для прогресса
-    duration = get_audio_duration(audio_path) if show_progress else 0
+            return WhisperModel(
+                model_name,
+                device=device,
+                compute_type=compute_type,
+                download_root=str(models_dir),
+                local_files_only=local_files_only,
+            )
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            if device == "cuda":
+                continue
+            break
 
-    segments, info = model.transcribe(
-        str(audio_path),
-        language=language,
-        word_timestamps=True,
-        vad_filter=True,  # фильтр тишины — ускоряет
-        vad_parameters=dict(
-            min_silence_duration_ms=500,
-            speech_pad_ms=200
+    raise TranscriptionError(f"Не удалось загрузить модель {model_name}: {last_error}")
+
+
+def transcribe(
+    model,
+    audio_path: Path,
+    language: str = "ru",
+    show_progress: bool = True,
+    prefix: str = "      ",
+) -> list[WordToken]:
+    duration = get_audio_duration(audio_path) if show_progress else 0.0
+    try:
+        segments, _ = model.transcribe(
+            str(audio_path),
+            language=language,
+            word_timestamps=True,
+            vad_filter=True,
+            vad_parameters=dict(min_silence_duration_ms=500, speech_pad_ms=200),
         )
-    )
+    except Exception as exc:  # noqa: BLE001
+        raise TranscriptionError(str(exc)) from exc
 
-    words = []
+    words: list[WordToken] = []
     for segment in segments:
-        # Обновляем прогресс
         if show_progress and duration > 0:
-            print_progress(segment.end, duration, "      🎤 Транскрипция")
-
+            print_progress(segment.end, duration, f"{prefix}🎤 Транскрипция")
         if segment.words:
             for word in segment.words:
-                words.append({
-                    "word": word.word.strip(),
-                    "start": word.start,
-                    "end": word.end
-                })
-
+                words.append(
+                    WordToken(
+                        word=word.word.strip(),
+                        start=float(word.start),
+                        end=float(word.end),
+                        probability=getattr(word, "probability", None),
+                    )
+                )
     return words
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# ПОИСК МАТА
-# ═══════════════════════════════════════════════════════════════════════════════
+# ============================================================================
+# ПОИСК МАТА И ИНТЕРВАЛЫ
+# ============================================================================
 
-def find_swears(words: list[dict], swears: set[str]) -> list[SwearMatch]:
-    """Находит матерные слова в транскрипции."""
-    matches = []
 
-    # Строим regex для каждого слова из словаря
-    # Учитываем возможные формы слова (окончания)
-    patterns = []
-    for swear in swears:
-        # Базовое слово + любые окончания
-        pattern = re.escape(swear)
-        patterns.append(pattern)
-
-    combined_pattern = re.compile(
-        r'\b(' + '|'.join(patterns) + r')[а-яёa-z]*\b',
-        re.IGNORECASE
-    )
-
-    for w in words:
-        clean_word = re.sub(r'[^\w]', '', w["word"].lower())
-        if combined_pattern.search(clean_word):
-            matches.append(SwearMatch(
-                start=max(0, w["start"] - PADDING_MS / 1000),
-                end=w["end"] + PADDING_MS / 1000,
-                word=w["word"]
-            ))
-
+def find_swears(
+    words: list[WordToken], matcher: re.Pattern[str], config: Config
+) -> list[SwearMatch]:
+    matches: list[SwearMatch] = []
+    for token in words:
+        clean_word = re.sub(r"[^\w]", "", token.word.lower())
+        if matcher.search(clean_word):
+            match = SwearMatch(
+                word=token.word,
+                start=token.start,
+                end=token.end,
+                probability=token.probability,
+            )
+            matches.append(match)
+            if config.verbose:
+                conf = (
+                    "n/a" if token.probability is None else f"{token.probability:.2f}"
+                )
+                log(
+                    f"        SWEAR: '{token.word}' at {token.start:.2f}-{token.end:.2f}s "
+                    f"(conf={conf})"
+                )
     return matches
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# ОБРАБОТКА АУДИО
-# ═══════════════════════════════════════════════════════════════════════════════
+def merge_intervals(
+    intervals: list[tuple[float, float]], merge_gap_ms: int = MERGE_GAP_MS
+) -> list[tuple[float, float]]:
+    if not intervals:
+        return []
+    gap = merge_gap_ms / 1000.0
+    sorted_intervals = sorted(intervals, key=lambda x: x[0])
+    merged: list[tuple[float, float]] = [sorted_intervals[0]]
+
+    for start, end in sorted_intervals[1:]:
+        last_start, last_end = merged[-1]
+        if start <= last_end + gap:
+            merged[-1] = (last_start, max(last_end, end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def build_censor_intervals(
+    matches: list[SwearMatch],
+    config: Config,
+    audio_duration: Optional[float] = None,
+) -> list[tuple[float, float]]:
+    pad = config.pad_ms / 1000.0
+    edge = config.edge_keep_ms / 1000.0
+    min_len = config.min_censor_ms / 1000.0
+
+    intervals: list[tuple[float, float]] = []
+    for m in matches:
+        base_start = max(0.0, m.start - pad)
+        base_end = m.end + pad
+        if audio_duration is not None:
+            base_end = min(base_end, audio_duration)
+
+        if config.edge_keep_enabled:
+            mute_start = base_start + edge
+            mute_end = base_end - edge
+            if (mute_end - mute_start) < min_len:
+                mute_start, mute_end = base_start, base_end
+                m.mode = "full"
+            else:
+                m.mode = "center"
+        else:
+            mute_start, mute_end = base_start, base_end
+            m.mode = "full"
+
+        m.mute_start = max(0.0, mute_start)
+        m.mute_end = max(m.mute_start, mute_end)
+        if m.mute_end > m.mute_start:
+            intervals.append((m.mute_start, m.mute_end))
+
+    return merge_intervals(intervals, merge_gap_ms=MERGE_GAP_MS)
+
+
+# ============================================================================
+# ЦЕНЗУРА АУДИО
+# ============================================================================
+
 
 def generate_beep(duration_sec: float, sample_rate: int, channels: int) -> np.ndarray:
-    """Генерирует бип заданной длительности."""
-    t = np.linspace(0, duration_sec, int(sample_rate * duration_sec), dtype=np.float32)
+    t = np.linspace(0, duration_sec, round(sample_rate * duration_sec), dtype=np.float32)
     beep = 0.5 * np.sin(2 * np.pi * BEEP_FREQ * t)
 
-    # Fade in/out для плавности
     fade_samples = min(int(0.01 * sample_rate), len(beep) // 4)
     if fade_samples > 0:
         beep[:fade_samples] *= np.linspace(0, 1, fade_samples)
@@ -462,522 +1129,979 @@ def generate_beep(duration_sec: float, sample_rate: int, channels: int) -> np.nd
 
     if channels > 1:
         beep = np.tile(beep.reshape(-1, 1), (1, channels))
-
     return beep
 
 
-def censor_audio(audio_path: Path, output_path: Path, matches: list[SwearMatch],
-                 sample_rate: int, channels: int, use_beep: bool = False,
-                 show_progress: bool = True) -> int:
-    """Накладывает цензуру на аудио."""
+def build_silence_filter_script(intervals: list[tuple[float, float]]) -> str:
+    lines: list[str] = []
+    for i, (start, end) in enumerate(intervals):
+        in_label = "[0:a]" if i == 0 else f"[a{i}]"
+        out_label = "[outa]" if i == len(intervals) - 1 else f"[a{i+1}]"
+        lines.append(
+            f"{in_label}volume=enable='between(t,{start:.6f},{end:.6f})':volume=0{out_label}"
+        )
+    return ";\n".join(lines)
+
+
+def censor_silence_ffmpeg(
+    input_wav: Path,
+    output_wav: Path,
+    intervals: list[tuple[float, float]],
+    show_progress: bool = False,
+    prefix: str = "      ",
+) -> int:
+    if not intervals:
+        shutil.copy2(input_wav, output_wav)
+        verify_output(output_wav, "censor_silence_ffmpeg(copy)")
+        return 0
+
+    fd, script_path_raw = tempfile.mkstemp(
+        suffix=".ffscript",
+        dir=str(output_wav.parent),
+        prefix="censor_",
+        text=True,
+    )
+    os.close(fd)
+    script_path = Path(script_path_raw)
+    register_temp_file(script_path)
+    script_path.write_text(build_silence_filter_script(intervals), encoding="utf-8")
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(input_wav),
+        "-filter_complex_script",
+        str(script_path),
+        "-map",
+        "[outa]",
+        "-acodec",
+        "pcm_f32le",
+        str(output_wav),
+    ]
+    if show_progress:
+        ok = run_ffmpeg_with_progress(
+            cmd, get_audio_duration(input_wav), f"{prefix}🔇 Цензура"
+        )
+    else:
+        ok = run_cmd(cmd, quiet=True).returncode == 0
+    if not ok:
+        raise CensorApplyError("Ошибка ffmpeg фильтра при mute-цензуре")
+    verify_output(output_wav, "censor_silence_ffmpeg")
+    return len(intervals)
+
+
+def censor_beep_blockwise(
+    input_wav: Path,
+    output_wav: Path,
+    intervals: list[tuple[float, float]],
+    show_progress: bool = True,
+    prefix: str = "      ",
+) -> int:
     import soundfile as sf
 
-    # Читаем аудио
-    audio, sr = sf.read(str(audio_path), dtype='float32')
+    if not intervals:
+        shutil.copy2(input_wav, output_wav)
+        verify_output(output_wav, "censor_beep_blockwise(copy)")
+        return 0
 
-    if audio.ndim == 1:
-        audio = audio.reshape(-1, 1)
-        actual_channels = 1
-    else:
-        actual_channels = audio.shape[1]
+    info = sf.info(str(input_wav))
+    sr = info.samplerate
+    channels = info.channels
+    total_frames = info.frames
 
-    censored_count = 0
-    total_matches = len(matches)
+    sample_intervals = [
+        (max(0, int(s * sr)), max(0, int(e * sr))) for s, e in intervals
+    ]
+    sample_intervals = [(s, e) for s, e in sample_intervals if e > s]
 
-    for i, match in enumerate(matches):
-        if show_progress and total_matches > 10:
-            print_progress(i + 1, total_matches, "      🔇 Цензура")
+    try:
+        with sf.SoundFile(
+            str(output_wav),
+            mode="w",
+            samplerate=sr,
+            channels=channels,
+            subtype="FLOAT",
+            format="WAV",
+        ) as out_f:
+            cursor = 0
+            interval_idx = 0
+            for block in sf.blocks(
+                str(input_wav), blocksize=65536, dtype="float32", always_2d=True
+            ):
+                block_len = len(block)
+                block_start = cursor
+                block_end = block_start + block_len
 
-        start_sample = int(match.start * sr)
-        end_sample = int(match.end * sr)
+                while (
+                    interval_idx < len(sample_intervals)
+                    and sample_intervals[interval_idx][1] <= block_start
+                ):
+                    interval_idx += 1
 
-        # Границы
-        start_sample = max(0, start_sample)
-        end_sample = min(len(audio), end_sample)
+                j = interval_idx
+                while j < len(sample_intervals) and sample_intervals[j][0] < block_end:
+                    s, e = sample_intervals[j]
+                    local_s = max(0, s - block_start)
+                    local_e = min(block_len, e - block_start)
+                    if local_e > local_s:
+                        dur = (local_e - local_s) / sr
+                        beep = generate_beep(dur, sr, channels)
+                        if beep.ndim == 1:
+                            beep = beep.reshape(-1, 1)
+                        target_len = local_e - local_s
+                        if beep.shape[0] > target_len:
+                            beep = beep[:target_len]
+                        elif beep.shape[0] < target_len:
+                            beep = np.pad(beep, ((0, target_len - beep.shape[0]), (0, 0)), mode="constant")
+                        block[local_s:local_e, :] = beep
+                    j += 1
 
-        if start_sample >= end_sample:
-            continue
+                out_f.write(block)
+                cursor = block_end
+                if show_progress and total_frames > 0:
+                    print_progress(cursor, total_frames, f"{prefix}🔇 Цензура")
+    except Exception as exc:  # noqa: BLE001
+        raise CensorApplyError(f"Ошибка blockwise beep-цензуры: {exc}") from exc
 
-        duration = (end_sample - start_sample) / sr
-
-        if use_beep:
-            beep = generate_beep(duration, sr, actual_channels)
-            if len(beep) != end_sample - start_sample:
-                beep = np.resize(beep, (end_sample - start_sample, actual_channels))
-            audio[start_sample:end_sample] = beep
-        else:
-            # Тишина
-            audio[start_sample:end_sample] = 0
-
-        censored_count += 1
-
-    # Записываем
-    if actual_channels == 1:
-        audio = audio.flatten()
-
-    sf.write(str(output_path), audio, sr, subtype='FLOAT')
-
-    return censored_count
+    verify_output(output_wav, "censor_beep_blockwise")
+    return len(sample_intervals)
 
 
-def encode_audio(input_wav: Path, output_file: Path, track: AudioTrack,
-                 show_progress: bool = False, prefix: str = "") -> bool:
-    """Кодирует WAV в оригинальный формат."""
-    codec_map = {
-        "aac": ["-c:a", "aac", "-b:a", "192k"],
-        "mp3": ["-c:a", "libmp3lame", "-b:a", "192k"],
-        "opus": ["-c:a", "libopus", "-b:a", "128k"],
-        "vorbis": ["-c:a", "libvorbis", "-b:a", "192k"],
-        "flac": ["-c:a", "flac"],
-        "ac3": ["-c:a", "ac3", "-b:a", "384k"],
-        "eac3": ["-c:a", "eac3", "-b:a", "384k"],
-        "dts": ["-c:a", "dca", "-b:a", "768k"],
+def censor_audio(
+    input_wav: Path,
+    output_wav: Path,
+    intervals: list[tuple[float, float]],
+    use_beep: bool,
+    show_progress: bool = True,
+    prefix: str = "      ",
+) -> int:
+    if use_beep:
+        return censor_beep_blockwise(
+            input_wav=input_wav,
+            output_wav=output_wav,
+            intervals=intervals,
+            show_progress=show_progress,
+            prefix=prefix,
+        )
+    return censor_silence_ffmpeg(
+        input_wav=input_wav,
+        output_wav=output_wav,
+        intervals=intervals,
+        show_progress=show_progress,
+        prefix=prefix,
+    )
+
+
+# ============================================================================
+# PIPELINE ОДНОГО АУДИО-СТРИМА
+# ============================================================================
+
+
+def load_transcript_cache(path: Path) -> Optional[list[WordToken]]:
+    if not path.exists():
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        return [
+            WordToken(
+                word=str(item["word"]),
+                start=float(item["start"]),
+                end=float(item["end"]),
+                probability=item.get("probability"),
+            )
+            for item in raw
+        ]
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+        print(f"⚠️  Поврежден кеш транскрипта, пересоздаю: {path.name}")
+        path.unlink(missing_ok=True)
+        return None
+
+
+def save_transcript_cache(path: Path, words: list[WordToken]):
+    path.write_text(
+        json.dumps([asdict(w) for w in words], ensure_ascii=False), encoding="utf-8"
+    )
+
+
+def build_track_paths(
+    cache_dir: Path, audio_index: Optional[int], final_ext: str
+) -> dict[str, Path]:
+    prefix = "audio" if audio_index is None else f"track_{audio_index}"
+    return {
+        "wav_whisper": cache_dir / f"{prefix}_16k.wav",
+        "wav_full": cache_dir / f"{prefix}_full.wav",
+        "wav_censored": cache_dir / f"{prefix}_censored.wav",
+        "transcript": cache_dir / f"{prefix}_transcript.json",
+        "skip_marker": cache_dir / f"{prefix}_skip",
+        "final": cache_dir / f"{prefix}_final{final_ext}",
     }
 
-    codec_args = codec_map.get(track.codec, ["-c:a", "aac", "-b:a", "192k"])
 
-    cmd = [
-        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-        "-i", str(input_wav),
-        "-ar", str(track.sample_rate),
-        "-ac", str(track.channels),
-        *codec_args,
-        str(output_file)
-    ]
+def process_audio_stream(
+    model,
+    source_file: Path,
+    audio_index: Optional[int],
+    track_info: AudioTrack,
+    cache_dir: Path,
+    matcher: re.Pattern[str],
+    config: Config,
+    final_ext: str,
+    preextracted_whisper: Optional[Path] = None,
+) -> TrackResult:
+    title = (
+        track_info.title
+        if track_info
+        else (source_file.stem if audio_index is None else f"Track {audio_index}")
+    )
+    result = TrackResult(track_index=audio_index, title=title)
+    paths = build_track_paths(cache_dir, audio_index, final_ext=final_ext)
+    if preextracted_whisper is not None:
+        paths["wav_whisper"] = preextracted_whisper
+    result.output_path = str(paths["final"])
 
-    if show_progress:
-        duration = get_audio_duration(input_wav)
-        return run_ffmpeg_with_progress(cmd, duration, prefix)
-    return run_cmd(cmd, quiet=True).returncode == 0
+    try:
+        with StepTimer(result, "cache-check") as st:
+            if paths["final"].exists():
+                st.skip("cache", cache_hit=True)
+                result.status = "cached"
+                result.censored_words = -1
+                result.found_matches = -1
+                result.applied_intervals = -1
+                return result
+
+        with StepTimer(result, "extract-whisper") as st:
+            if paths["wav_whisper"].exists():
+                st.skip("cache", cache_hit=True)
+            else:
+                ok = to_whisper_wav(
+                    source_file,
+                    paths["wav_whisper"],
+                    audio_index=audio_index,
+                    show_progress=False,
+                )
+                if not ok:
+                    raise ExtractError("Не удалось извлечь WAV для Whisper")
+
+        silent = False
+        with StepTimer(result, "silence-check") as st:
+            if paths["skip_marker"].exists():
+                st.skip("silent-cache", cache_hit=True)
+                silent = True
+            elif is_silent(paths["wav_whisper"]):
+                paths["skip_marker"].touch()
+                st.skip("silent")
+                silent = True
+
+        if silent:
+            with StepTimer(result, "copy-silent-original"):
+                if not copy_audio_source(source_file, paths["final"], audio_index):
+                    raise EncodeError("Не удалось скопировать тихий исходный аудиопоток")
+            result.status = "ok"
+            return result
+
+        with StepTimer(result, "transcribe") as st:
+            words = load_transcript_cache(paths["transcript"])
+            if words is not None:
+                st.skip("cache transcript", cache_hit=True)
+            else:
+                words = transcribe(
+                    model,
+                    paths["wav_whisper"],
+                    language=config.language,
+                    show_progress=True,
+                )
+                save_transcript_cache(paths["transcript"], words)
+
+        with StepTimer(result, "match") as st:
+            matches = find_swears(words, matcher, config)
+            duration = get_audio_duration(paths["wav_whisper"])
+            intervals = build_censor_intervals(matches, config, audio_duration=duration)
+            result.found_matches = len(matches)
+            result.applied_intervals = len(intervals)
+            result.censored_words = len(matches)
+            if config.verbose:
+                for m in matches:
+                    conf = "n/a" if m.probability is None else f"{m.probability:.2f}"
+                    print(
+                        f"        -> {m.mode.upper()} mute {m.mute_start:.2f}-{m.mute_end:.2f}s "
+                        f"for '{m.word}' (conf={conf})"
+                    )
+            if not intervals:
+                st.skip("no-matches")
+
+        if not intervals:
+            with StepTimer(result, "copy-original"):
+                if not copy_audio_source(source_file, paths["final"], audio_index):
+                    raise EncodeError("Не удалось скопировать исходный аудиопоток")
+            result.status = "ok"
+            return result
+
+        with StepTimer(result, "extract-full") as st:
+            if paths["wav_full"].exists():
+                st.skip("cache", cache_hit=True)
+            else:
+                dur = get_audio_duration(source_file)
+                required = estimate_wav_bytes(
+                    dur, track_info.sample_rate, track_info.channels
+                )
+                check_disk_space(paths["wav_full"], required)
+                ok = to_full_wav(
+                    source_file,
+                    paths["wav_full"],
+                    audio_index=audio_index,
+                    show_progress=False,
+                )
+                if not ok:
+                    raise ExtractError("Не удалось извлечь WAV в полном качестве")
+
+        with StepTimer(result, "censor"):
+            applied = censor_audio(
+                input_wav=paths["wav_full"],
+                output_wav=paths["wav_censored"],
+                intervals=intervals,
+                use_beep=config.use_beep,
+                show_progress=True,
+            )
+            result.applied_intervals = applied
+
+        with StepTimer(result, "encode"):
+            ok = encode_audio(
+                paths["wav_censored"], paths["final"], track_info, show_progress=False
+            )
+            if not ok:
+                raise EncodeError("Не удалось закодировать финальное аудио")
+
+        result.status = "ok"
+        return result
+
+    except Exception as exc:  # noqa: BLE001
+        result.status = "failed"
+        add_error(result, f"{type(exc).__name__}: {exc}")
+        return result
 
 
-def copy_audio_track(input_file: Path, track: AudioTrack, output_file: Path) -> bool:
-    """Копирует дорожку без изменений."""
-    cmd = [
-        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-        "-i", str(input_file),
-        "-map", f"0:a:{track.audio_index}",
-        "-c:a", "copy",
-        str(output_file)
-    ]
-    return run_cmd(cmd, quiet=True).returncode == 0
+# ============================================================================
+# ОБРАБОТКА ФАЙЛОВ
+# ============================================================================
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# СБОРКА ВИДЕО
-# ═══════════════════════════════════════════════════════════════════════════════
+def preextract_whisper_tracks(
+    input_file: Path, tracks: list[AudioTrack], cache_dir: Path
+):
+    if not tracks:
+        return
+    max_workers = min(2, len(tracks))
+    if max_workers <= 1:
+        for t in tracks:
+            wav = cache_dir / f"track_{t.audio_index}_16k.wav"
+            if not wav.exists():
+                to_whisper_wav(
+                    input_file, wav, audio_index=t.audio_index, show_progress=False
+                )
+        return
 
-def assemble_video(input_file: Path, audio_files: list[Path],
-                   output_file: Path, tracks: list[AudioTrack]) -> bool:
-    """Собирает финальное видео."""
-    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "warning", "-stats",
-           "-i", str(input_file)]
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {}
+        for t in tracks:
+            wav = cache_dir / f"track_{t.audio_index}_16k.wav"
+            if wav.exists():
+                continue
+            fut = ex.submit(to_whisper_wav, input_file, wav, t.audio_index, False, "")
+            futures[fut] = (t.audio_index, wav)
 
-    for audio in audio_files:
-        cmd.extend(["-i", str(audio)])
-
-    # Маппинг: видео и субтитры из оригинала, аудио из обработанных
-    cmd.extend(["-map", "0:v?"])
-
-    for i in range(len(audio_files)):
-        cmd.extend(["-map", f"{i+1}:a:0"])
-
-    cmd.extend(["-map", "0:s?"])  # субтитры
-    cmd.extend(["-c:v", "copy", "-c:s", "copy", "-c:a", "copy"])
-
-    # Метаданные дорожек
-    for i, track in enumerate(tracks):
-        if track.title:
-            cmd.extend([f"-metadata:s:a:{i}", f"title={track.title}"])
-
-    cmd.append(str(output_file))
-
-    return run_cmd(cmd, quiet=False).returncode == 0
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# ОСНОВНАЯ ЛОГИКА
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def process_track(model, input_file: Path, track: AudioTrack, cache_dir: Path,
-                  swears: set[str], use_beep: bool) -> tuple[Path, int]:
-    """Обрабатывает одну аудиодорожку."""
-
-    idx = track.audio_index
-
-    # Пути
-    wav_whisper = cache_dir / f"track_{idx}_16k.wav"
-    wav_full = cache_dir / f"track_{idx}_full.wav"
-    wav_censored = cache_dir / f"track_{idx}_censored.wav"
-    final_audio = cache_dir / f"track_{idx}_final.mka"
-    transcript_cache = cache_dir / f"track_{idx}_transcript.json"
-    skip_marker = cache_dir / f"track_{idx}_skip"
-
-    # Уже готово?
-    if final_audio.exists():
-        log(f"💾 Кеш", prefix="      ")
-        return final_audio, -1  # -1 = из кеша
-
-    # Пропущена ранее?
-    if skip_marker.exists():
-        log(f"🔇 Тихая (кеш)", prefix="      ")
-        if not final_audio.exists():
-            copy_audio_track(input_file, track, final_audio)
-        return final_audio, 0
-
-    # 1. Извлекаем для Whisper (16kHz mono)
-    if not wav_whisper.exists():
-        log(f"📤 Извлечение...", prefix="      ")
-        if not extract_audio(input_file, track, wav_whisper):
-            raise RuntimeError("Ошибка извлечения")
-
-    # 2. Проверка на тишину
-    if is_silent(wav_whisper):
-        log(f"🔇 Тихая дорожка", prefix="      ")
-        skip_marker.touch()
-        copy_audio_track(input_file, track, final_audio)
-        return final_audio, 0
-
-    # 3. Транскрипция
-    words = []
-    if transcript_cache.exists():
-        log(f"📝 Транскрипт из кеша", prefix="      ")
-        words = json.loads(transcript_cache.read_text(encoding="utf-8"))
-    else:
-        log(f"🎤 Транскрипция...", prefix="      ")
-        words = transcribe(model, wav_whisper)
-        transcript_cache.write_text(json.dumps(words, ensure_ascii=False), encoding="utf-8")
-
-    # 4. Поиск мата
-    matches = find_swears(words, swears)
-    log(f"🔍 Найдено: {len(matches)} слов", prefix="      ")
-
-    if not matches:
-        # Нет мата — копируем как есть
-        copy_audio_track(input_file, track, final_audio)
-        return final_audio, 0
-
-    # 5. Извлекаем полное качество
-    if not wav_full.exists():
-        log(f"📤 Извлечение (полное качество)...", prefix="      ")
-        if not extract_audio_full(input_file, track, wav_full):
-            raise RuntimeError("Ошибка извлечения")
-
-    # 6. Цензурим
-    log(f"🔇 Цензура...", prefix="      ")
-    censored = censor_audio(wav_full, wav_censored, matches,
-                            track.sample_rate, track.channels, use_beep)
-
-    # 7. Кодируем обратно
-    log(f"🔄 Кодирование ({track.codec})...", prefix="      ")
-    if not encode_audio(wav_censored, final_audio, track):
-        raise RuntimeError("Ошибка кодирования")
-
-    return final_audio, censored
+        for fut in as_completed(futures):
+            idx, wav = futures[fut]
+            try:
+                ok = fut.result()
+            except Exception as exc:  # noqa: BLE001
+                print(f"      ⚠️  Предизвлечение дорожки {idx} провалилось: {exc}")
+                continue
+            if not ok:
+                print(f"      ⚠️  Предизвлечение дорожки {idx} провалилось")
+            elif not wav.exists():
+                print(f"      ⚠️  Предизвлечение дорожки {idx}: файл не создан")
 
 
-def process_audio_file(input_file: Path, output_file: Path, model,
-                       swears: set[str], use_beep: bool) -> bool:
-    """Обрабатывает чистый аудиофайл (без видео)."""
+def process_audio_file(
+    input_file: Path,
+    output_file: Path,
+    model,
+    matcher: re.Pattern[str],
+    swears_hash: str,
+    config: Config,
+) -> FileResult:
+    """Обрабатывает аудиофайл: транскрипция → поиск мата → цензура.
+
+    Сохраняет оригинальное качество (битрейт определяется из метаданных).
+    """
+    file_result = FileResult(
+        input_path=str(input_file),
+        output_path=str(output_file),
+        media_type="audio",
+    )
+    file_start = time.monotonic()
 
     print(f"\n🎵 Вход:  {input_file}")
     print(f"📁 Выход: {output_file}")
-    print()
 
-    # Кеш
-    cache_dir = get_cache_dir(input_file)
-    log(f"💾 Кеш: {cache_dir}")
+    try:
+        with StepTimer(file_result, "probe-audio", prefix="   "):
+            audio_info = get_audio_info(input_file)
+            if not audio_info:
+                raise ProbeError("Не удалось прочитать аудиофайл")
 
-    # Получаем информацию об аудио
-    audio_info = get_audio_info(input_file)
-    if not audio_info:
-        print("❌ Не удалось прочитать аудиофайл!")
-        return False
+        cache_dir = get_processing_cache_dir(input_file, config, swears_hash)
+        log(f"💾 Кеш: {cache_dir}")
+        print(
+            f"📊 {audio_info.codec}, {audio_info.channels}ch, {audio_info.sample_rate}Hz"
+        )
 
-    print(f"📊 {audio_info.codec}, {audio_info.channels}ch, {audio_info.sample_rate}Hz")
+        track_result = process_audio_stream(
+            model=model,
+            source_file=input_file,
+            audio_index=None,
+            track_info=audio_info,
+            cache_dir=cache_dir,
+            matcher=matcher,
+            config=config,
+            final_ext=output_file.suffix,
+        )
+        file_result.tracks.append(track_result)
+        if track_result.status == "failed":
+            raise CensorErrorBase("; ".join(track_result.errors))
 
-    # Пути
-    wav_whisper = cache_dir / "audio_16k.wav"
-    wav_full = cache_dir / "audio_full.wav"
-    wav_censored = cache_dir / "audio_censored.wav"
-    transcript_cache = cache_dir / "transcript.json"
+        final_cache_path = Path(track_result.output_path)
+        with StepTimer(file_result, "finalize-output", prefix="   "):
+            shutil.copy2(final_cache_path, output_file)
+            verify_output(output_file, "final output audio")
 
-    # 1. Конвертируем для Whisper (16kHz mono)
-    if not wav_whisper.exists():
-        log("📤 Конвертация для транскрипции...")
-        if not convert_audio_for_whisper(input_file, wav_whisper,
-                                         show_progress=True, prefix="   📤 Конвертация"):
-            print("❌ Ошибка конвертации")
-            return False
+        file_result.total_matches = max(0, track_result.found_matches)
+        file_result.total_censored = max(0, track_result.censored_words)
+        file_result.status = "ok"
 
-    # 2. Проверка на тишину
-    if is_silent(wav_whisper):
-        log("🔇 Тихий файл — копируем как есть")
-        shutil.copy(input_file, output_file)
-        return True
+    except Exception as exc:  # noqa: BLE001
+        file_result.status = "failed"
+        add_error(file_result, f"{type(exc).__name__}: {exc}")
 
-    # 3. Транскрипция
-    words = []
-    if transcript_cache.exists():
-        log("📝 Транскрипт из кеша")
-        words = json.loads(transcript_cache.read_text(encoding="utf-8"))
+    file_result.duration_ms = (time.monotonic() - file_start) * 1000.0
+    if file_result.status == "ok":
+        size_mb = (
+            output_file.stat().st_size / (1024 * 1024) if output_file.exists() else 0.0
+        )
+        print(f"✅ Готово: {output_file} ({size_mb:.1f} MB)")
+        print(
+            f"   Найдено: {file_result.total_matches}, зацензурено: {file_result.total_censored}"
+        )
     else:
-        log("🎤 Транскрипция...")
-        words = transcribe(model, wav_whisper)
-        transcript_cache.write_text(json.dumps(words, ensure_ascii=False), encoding="utf-8")
-
-    # 4. Поиск мата
-    matches = find_swears(words, swears)
-    log(f"🔍 Найдено: {len(matches)} слов")
-
-    if not matches:
-        log("✅ Мата нет — копируем как есть")
-        shutil.copy(input_file, output_file)
-        return True
-
-    # 5. Конвертируем в полное качество
-    if not wav_full.exists():
-        log("📤 Конвертация (полное качество)...")
-        if not convert_audio_full(input_file, wav_full,
-                                  show_progress=True, prefix="   📤 Конвертация"):
-            print("❌ Ошибка конвертации")
-            return False
-
-    # 6. Цензурим
-    log("🔇 Цензура...")
-    censored = censor_audio(wav_full, wav_censored, matches,
-                            audio_info.sample_rate, audio_info.channels, use_beep)
-
-    # 7. Кодируем в исходный формат
-    log(f"🔄 Кодирование ({audio_info.codec})...")
-    if not encode_audio(wav_censored, output_file, audio_info,
-                        show_progress=True, prefix="   🔄 Кодирование"):
-        print("❌ Ошибка кодирования")
-        return False
-
-    print(f"\n{'═'*50}")
-    print("✅ ГОТОВО!")
-    print(f"📁 {output_file}")
-    print(f"🔇 Зацензурено: {censored} слов")
-    print('═'*50)
-
-    return True
+        print(f"❌ Ошибка аудиофайла: {input_file.name}")
+        for e in file_result.errors:
+            print(f"   - {e}")
+    return file_result
 
 
-def process_video_file(input_file: Path, output_file: Path, model,
-                       swears: set[str], track_filter: Optional[list[int]],
-                       use_beep: bool) -> bool:
-    """Обрабатывает видеофайл."""
+def process_video_file(
+    input_file: Path,
+    output_file: Path,
+    model,
+    matcher: re.Pattern[str],
+    swears_hash: str,
+    config: Config,
+) -> FileResult:
+    """Обрабатывает видеофайл: извлечение дорожек → цензура → сборка.
+
+    Если дорожек >1 и -t не указан — интерактивный выбор в терминале.
+    После сборки видео экспортирует обработанные дорожки отдельными файлами.
+    Вывод: «Было» (оригинал), «Стало» (видео), «Стало 2» (отдельные дорожки).
+    """
+    file_result = FileResult(
+        input_path=str(input_file),
+        output_path=str(output_file),
+        media_type="video",
+    )
+    file_start = time.monotonic()
+    had_track_error = False
+    exported: list[Path] = []
 
     print(f"\n🎬 Вход:  {input_file}")
     print(f"📁 Выход: {output_file}")
-    print()
 
-    # Кеш
-    cache_dir = get_cache_dir(input_file)
-    log(f"💾 Кеш: {cache_dir}")
+    try:
+        with StepTimer(file_result, "probe-video", prefix="   "):
+            tracks = get_audio_tracks(input_file)
+            if not tracks:
+                raise ProbeError("Аудиодорожки не найдены")
 
-    # Получаем дорожки
-    tracks = get_audio_tracks(input_file)
-    if not tracks:
-        print("❌ Аудиодорожки не найдены!")
-        return False
+        available = {t.audio_index for t in tracks}
+        if config.track_filter is not None:
+            missing = [x for x in config.track_filter if x not in available]
+            if missing:
+                raise ValidationError(f"Нет дорожек с индексами: {missing}")
+            selected = set(config.track_filter)
+        elif len(tracks) > 1:
+            selected = interactive_track_selection(tracks)
+        else:
+            selected = available
 
-    print(f"\n📊 Аудиодорожек: {len(tracks)}")
-    for t in tracks:
-        print(f"   [{t.audio_index}] {t.title} ({t.codec}, {t.channels}ch, {t.sample_rate}Hz)")
+        # interactive_track_selection уже показывает список дорожек,
+        # поэтому выводим только когда выбор был неинтерактивным
+        if config.track_filter is not None or len(tracks) == 1:
+            print(f"\n📊 Аудиодорожек: {len(tracks)}")
+            for t in tracks:
+                br = f", {format_bitrate(t.bitrate)}" if t.bitrate else ""
+                mark = "✓" if t.audio_index in selected else " "
+                print(
+                    f"   [{mark}] {t.audio_index}: {t.title} "
+                    f"({t.codec}, {t.channels}ch, {t.sample_rate}Hz{br})"
+                )
+        print(f"\n⚙️  Обработка дорожек: {sorted(selected)}")
 
-    # Фильтр
-    if track_filter:
-        tracks = [t for t in tracks if t.audio_index in track_filter]
-        print(f"\n⚙️  Выбраны дорожки: {track_filter}")
+        cache_dir = get_processing_cache_dir(input_file, config, swears_hash)
+        log(f"💾 Кеш: {cache_dir}")
 
-    # Обрабатываем дорожки
-    processed_files = []
-    total_censored = 0
+        with StepTimer(file_result, "preextract-whisper", prefix="   ") as st:
+            selected_tracks = [t for t in tracks if t.audio_index in selected]
+            preextract_whisper_tracks(input_file, selected_tracks, cache_dir)
+            st.info(f"tracks={len(selected_tracks)}")
 
-    for i, track in enumerate(tracks, 1):
-        print(f"\n{'─'*50}")
-        print(f"🎵 [{i}/{len(tracks)}] Дорожка {track.audio_index}: {track.title}")
+        audio_files_for_mux: list[Path] = []
+        processed_paths: dict[int, Path] = {}
+        for i, track in enumerate(tracks, 1):
+            print(f"\n{'─'*56}")
+            print(f"🎵 [{i}/{len(tracks)}] Дорожка {track.audio_index}: {track.title}")
+            final_track_path = cache_dir / f"track_{track.audio_index}_final.mka"
 
-        try:
-            audio_file, censored = process_track(
-                model, input_file, track, cache_dir, swears, use_beep
+            if track.audio_index not in selected:
+                tr = TrackResult(
+                    track_index=track.audio_index,
+                    title=track.title,
+                    output_path=str(final_track_path),
+                )
+                with StepTimer(tr, "copy-unselected") as st:
+                    if final_track_path.exists():
+                        tr.status = "cached"
+                        st.skip("cache", cache_hit=True)
+                    else:
+                        ok = copy_audio_source(
+                            input_file, final_track_path, track.audio_index
+                        )
+                        if not ok:
+                            raise EncodeError(
+                                "Не удалось скопировать невыбранную дорожку"
+                            )
+                        tr.status = "copied"
+                file_result.tracks.append(tr)
+                audio_files_for_mux.append(final_track_path)
+                continue
+
+            tr = process_audio_stream(
+                model=model,
+                source_file=input_file,
+                audio_index=track.audio_index,
+                track_info=track,
+                cache_dir=cache_dir,
+                matcher=matcher,
+                config=config,
+                final_ext=".mka",
+                preextracted_whisper=cache_dir / f"track_{track.audio_index}_16k.wav",
             )
-            processed_files.append(audio_file)
-            if censored > 0:
-                total_censored += censored
-                log(f"✅ Зацензурено: {censored}", prefix="      ")
-            elif censored == 0:
-                log("✅ Готово (мата нет)", prefix="      ")
-            else:
-                log("✅ Готово (из кеша)", prefix="      ")
-        except Exception as e:
-            print(f"      ❌ Ошибка: {e}")
-            return False
 
-    # Сборка
-    print(f"\n{'─'*50}")
-    print("📦 Сборка видео...")
+            if tr.status == "failed":
+                had_track_error = True
+                print("      ⚠️  Ошибка обработки дорожки, fallback на исходную копию")
+                add_error(tr, "fallback_to_original")
+                with StepTimer(tr, "fallback-copy"):
+                    ok = copy_audio_source(
+                        input_file, final_track_path, track.audio_index
+                    )
+                    if not ok:
+                        raise EncodeError(
+                            f"Fallback copy не удался для дорожки {track.audio_index}"
+                        )
+                tr.status = "fallback_copy"
+                tr.output_path = str(final_track_path)
 
-    if not assemble_video(input_file, processed_files, output_file, tracks):
-        print("❌ Ошибка сборки")
-        return False
+            file_result.total_matches += max(0, tr.found_matches)
+            file_result.total_censored += max(0, tr.censored_words)
+            file_result.tracks.append(tr)
+            track_output = Path(tr.output_path)
+            audio_files_for_mux.append(track_output)
+            if track.audio_index in selected and tr.status != "fallback_copy":
+                processed_paths[track.audio_index] = track_output
 
-    print(f"\n{'═'*50}")
-    print("✅ ГОТОВО!")
-    print(f"📁 {output_file}")
-    print(f"🔇 Всего зацензурено: {total_censored} слов")
-    print('═'*50)
+        with StepTimer(file_result, "assemble-video", prefix="   "):
+            if not assemble_video(input_file, audio_files_for_mux, output_file, tracks):
+                raise AssembleError("Ошибка сборки финального видео")
 
-    return True
+        # Экспорт отдельных обработанных аудиодорожек
+        exported: list[Path] = []
+        if processed_paths:
+            with StepTimer(file_result, "export-tracks", prefix="   "):
+                exported = export_separate_tracks(
+                    tracks, processed_paths, selected,
+                    output_file.parent, input_file.stem,
+                )
+                file_result.exported_tracks = [str(p) for p in exported]
+
+        file_result.status = "partial_failed" if had_track_error else "ok"
+
+    except Exception as exc:  # noqa: BLE001
+        file_result.status = "failed"
+        add_error(file_result, f"{type(exc).__name__}: {exc}")
+
+    file_result.duration_ms = (time.monotonic() - file_start) * 1000.0
+    if file_result.status in {"ok", "partial_failed"}:
+        size_mb = (
+            output_file.stat().st_size / (1024 * 1024) if output_file.exists() else 0.0
+        )
+        print(f"\n{'═'*56}")
+        print(f"  Было:    {input_file}")
+        print(f"  Стало:   {output_file} ({size_mb:.1f} MB)")
+        if exported:
+            print("  Стало 2: Отдельные дорожки:")
+            for ep in exported:
+                sz = ep.stat().st_size / (1024 * 1024)
+                print(f"           {ep.name} ({sz:.1f} MB)")
+        print(f"{'═'*56}")
+        print(
+            f"   Найдено: {file_result.total_matches}, "
+            f"зацензурено: {file_result.total_censored}, "
+            f"время: {file_result.duration_ms / 1000:.1f}s"
+        )
+    else:
+        print(f"\n❌ Ошибка видеофайла: {input_file.name}")
+        for e in file_result.errors:
+            print(f"   - {e}")
+    return file_result
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ============================================================================
+# ОТЧЕТ
+# ============================================================================
+
+
+def build_run_report(file_results: list[FileResult]) -> dict[str, Any]:
+    totals = {
+        "files_total": len(file_results),
+        "files_ok": sum(1 for r in file_results if r.status == "ok"),
+        "files_partial_failed": sum(
+            1 for r in file_results if r.status == "partial_failed"
+        ),
+        "files_failed": sum(1 for r in file_results if r.status == "failed"),
+        "matches_total": sum(r.total_matches for r in file_results),
+        "censored_total": sum(r.total_censored for r in file_results),
+        "duration_ms_total": sum(r.duration_ms for r in file_results),
+    }
+    files = [jsonable(asdict(r)) for r in file_results]
+    return {"totals": totals, "files": files}
+
+
+def write_report_json(path: Path, report: dict[str, Any]):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"🧾 JSON-отчет: {path}")
+
+
+# ============================================================================
 # CLI
-# ═══════════════════════════════════════════════════════════════════════════════
+# ============================================================================
 
-def main():
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Быстрая цензура мата в видео и аудио (GPU)",
+        description="Быстрая цензура мата в видео и аудио (GPU/CPU fallback)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Примеры:
-  %(prog)s video.mkv                    # видео, все дорожки, модель medium
-  %(prog)s podcast.mp3                  # аудиофайл
-  %(prog)s *.mkv *.mp3                  # несколько файлов
-  %(prog)s video.mkv -m large-v3        # точнее, но медленнее
-  %(prog)s video.mkv -t 0,2             # только дорожки 0 и 2
-  %(prog)s video.mkv --beep             # бип вместо тишины
-  %(prog)s video.mkv --info             # показать дорожки
-  %(prog)s --clear-cache                # очистить весь кеш
-        """
+  %(prog)s video.mkv
+  %(prog)s podcast.mp3
+  %(prog)s video.mkv --beep
+  %(prog)s video.mkv --hard
+  %(prog)s video.mkv --pad-ms 20 --edge-keep-ms 15
+  %(prog)s video.mkv -t 0,2
+  %(prog)s video.mkv --report-json report.json
+  %(prog)s video.mkv --info
+  %(prog)s --clear-cache
+        """,
     )
 
     parser.add_argument("input", nargs="*", help="Входные файлы (видео или аудио)")
-    parser.add_argument("-o", "--output", help="Выходной файл (только для одного входного)")
-    parser.add_argument("-m", "--model", default=DEFAULT_MODEL,
-                        help=f"Модель Whisper (default: {DEFAULT_MODEL})")
-    parser.add_argument("-t", "--tracks", help="Дорожки для видео (например: 0,2,4)")
+    parser.add_argument(
+        "-o", "--output", help="Выходной файл (только для одного входного)"
+    )
+    parser.add_argument(
+        "-m",
+        "--model",
+        default=DEFAULT_MODEL,
+        help=f"Модель Whisper (default: {DEFAULT_MODEL})",
+    )
+    parser.add_argument("-t", "--tracks", help="Дорожки для видео, например: 0,2,4")
     parser.add_argument("--beep", action="store_true", help="Бип вместо тишины")
     parser.add_argument("--info", action="store_true", help="Показать дорожки")
-    parser.add_argument("--clear-cache", action="store_true", help="Очистить кеш (без моделей)")
-    parser.add_argument("--clear-models", action="store_true", help="Очистить скачанные модели")
+    parser.add_argument(
+        "--clear-cache", action="store_true", help="Очистить кеш (без моделей)"
+    )
+    parser.add_argument(
+        "--clear-models", action="store_true", help="Очистить скачанные модели"
+    )
 
+    parser.add_argument("--pad-ms", type=int, default=None, help="Паддинг цензуры в мс")
+    parser.add_argument(
+        "--edge-keep-ms",
+        type=int,
+        default=DEFAULT_EDGE_KEEP_MS,
+        help="Оставлять края слова (мс)",
+    )
+    parser.add_argument(
+        "--min-censor-ms",
+        type=int,
+        default=DEFAULT_MIN_CENSOR_MS,
+        help="Минимальная длина mute-интервала (иначе глушим весь базовый интервал)",
+    )
+    parser.add_argument(
+        "--no-edge-keep", action="store_true", help="Отключить сохранение краев"
+    )
+    parser.add_argument(
+        "--hard",
+        action="store_true",
+        help="Алиас старого режима: no-edge-keep + pad=50ms",
+    )
+    parser.add_argument(
+        "-v", "--verbose", action="store_true", help="Подробный вывод по этапам/матчам"
+    )
+    parser.add_argument("--report-json", help="Сохранить JSON-отчет в файл")
+    parser.add_argument(
+        "--language", default="ru", help="Язык транскрипции (default: ru)"
+    )
+    return parser
+
+
+def handle_cache_clear():
+    if CACHE_DIR.exists():
+        models_dir = CACHE_DIR / "models"
+        for item in CACHE_DIR.iterdir():
+            if item == models_dir:
+                continue
+            if item.is_dir():
+                shutil.rmtree(item)
+            else:
+                item.unlink()
+        print(f"🗑️  Кеш очищен (модели сохранены): {CACHE_DIR}")
+    else:
+        print("Кеш пуст")
+
+
+def handle_models_clear():
+    models_dir = CACHE_DIR / "models"
+    if models_dir.exists():
+        shutil.rmtree(models_dir)
+        print(f"🗑️  Модели удалены: {models_dir}")
+    else:
+        print("Модели не найдены")
+
+
+def build_config(args: argparse.Namespace, track_filter: Optional[list[int]]) -> Config:
+    if args.hard:
+        pad_ms = HARD_PAD_MS if args.pad_ms is None else args.pad_ms
+        edge_keep_enabled = False
+    else:
+        pad_ms = DEFAULT_PAD_MS if args.pad_ms is None else args.pad_ms
+        edge_keep_enabled = not args.no_edge_keep
+
+    cfg = Config(
+        model_name=args.model,
+        use_beep=args.beep,
+        pad_ms=pad_ms,
+        edge_keep_ms=args.edge_keep_ms,
+        edge_keep_enabled=edge_keep_enabled,
+        min_censor_ms=args.min_censor_ms,
+        track_filter=track_filter,
+        verbose=args.verbose,
+        language=args.language,
+        report_json_path=Path(args.report_json).resolve() if args.report_json else None,
+    )
+
+    if cfg.pad_ms < 0 or cfg.edge_keep_ms < 0 or cfg.min_censor_ms < 0:
+        raise ValidationError("Параметры миллисекунд не могут быть отрицательными")
+    return cfg
+
+
+def format_bitrate(bitrate: Optional[int]) -> str:
+    """Форматирует битрейт для вывода (например 192000 → '192 kbps')."""
+    if not bitrate:
+        return ""
+    return f"{bitrate // 1000} kbps"
+
+
+def print_info(input_files: list[Path]):
+    for input_path in input_files:
+        print(f"\n📁 {input_path}")
+        try:
+            media_type = probe_media_type(input_path)
+        except ValidationError as exc:
+            print(f"    ❌ {exc}")
+            continue
+
+        if media_type == "audio":
+            info = get_audio_info(input_path)
+            if info:
+                br = f", {format_bitrate(info.bitrate)}" if info.bitrate else ""
+                print(
+                    f"    🎵 Аудио: {info.codec}, {info.channels}ch, "
+                    f"{info.sample_rate}Hz{br}"
+                )
+            else:
+                print("    ❌ Не удалось прочитать аудио")
+        else:
+            tracks = get_audio_tracks(input_path)
+            if not tracks:
+                print("    ❌ Аудиодорожки не найдены")
+            for t in tracks:
+                br = f", {format_bitrate(t.bitrate)}" if t.bitrate else ""
+                print(f"    [{t.audio_index}] {t.title}")
+                print(f"        {t.codec}, {t.channels}ch, {t.sample_rate}Hz{br}")
+
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
 
-    # Очистка кеша (без моделей)
-    if args.clear_cache:
-        if CACHE_DIR.exists():
-            models_dir = CACHE_DIR / "models"
-            for item in CACHE_DIR.iterdir():
-                if item == models_dir:
-                    continue
-                if item.is_dir():
-                    shutil.rmtree(item)
-                else:
-                    item.unlink()
-            print(f"🗑️  Кеш очищен (модели сохранены): {CACHE_DIR}")
-        else:
-            print("Кеш пуст")
-        return
+    try:
+        if args.clear_cache:
+            handle_cache_clear()
+            return
+        if args.clear_models:
+            handle_models_clear()
+            return
 
-    # Очистка моделей
-    if args.clear_models:
-        models_dir = CACHE_DIR / "models"
-        if models_dir.exists():
-            shutil.rmtree(models_dir)
-            print(f"🗑️  Модели удалены: {models_dir}")
-        else:
-            print("Модели не найдены")
-        return
+        check_dependencies()
 
-    if not args.input:
-        parser.print_help()
-        return
+        if not args.input:
+            parser.print_help()
+            return
 
-    # Собираем и проверяем входные файлы
-    input_files = []
-    for pattern in args.input:
-        path = Path(pattern).resolve()
-        if path.exists():
-            input_files.append(path)
-        else:
-            print(f"❌ Файл не найден: {path}")
-
-    if not input_files:
-        print("❌ Нет файлов для обработки!")
-        sys.exit(1)
-
-    # Инфо (только для первого файла)
-    if args.info:
-        for input_path in input_files:
-            print(f"\n📁 {input_path}")
-            if is_audio_file(input_path):
-                info = get_audio_info(input_path)
-                if info:
-                    print(f"    🎵 Аудио: {info.codec}, {info.channels}ch, {info.sample_rate}Hz")
+        input_files: list[Path] = []
+        seen_paths: set[Path] = set()
+        for pattern in args.input:
+            expanded = glob.glob(pattern, recursive=True)
+            if expanded:
+                for match in expanded:
+                    p = Path(match).resolve()
+                    if p.is_file() and p not in seen_paths:
+                        seen_paths.add(p)
+                        input_files.append(p)
             else:
-                tracks = get_audio_tracks(input_path)
-                for t in tracks:
-                    print(f"    [{t.audio_index}] {t.title}")
-                    print(f"        {t.codec}, {t.channels}ch, {t.sample_rate}Hz")
-        return
+                path = Path(pattern).resolve()
+                if path.exists():
+                    if path not in seen_paths:
+                        seen_paths.add(path)
+                        input_files.append(path)
+                else:
+                    print(f"❌ Файл не найден: {path}")
+        if not input_files:
+            raise ValidationError("Нет файлов для обработки")
 
-    # Проверка на -o при нескольких файлах
-    if args.output and len(input_files) > 1:
-        print("❌ Опция -o/--output работает только с одним входным файлом!")
-        sys.exit(1)
+        if args.output and len(input_files) > 1:
+            raise ValidationError(
+                "Опция -o/--output работает только с одним входным файлом"
+            )
 
-    # Фильтр дорожек
-    track_filter = None
-    if args.tracks:
-        track_filter = [int(x.strip()) for x in args.tracks.split(",")]
+        if args.info:
+            print_info(input_files)
+            return
 
-    # Загружаем словарь и модель один раз
-    swears = load_swears()
-    print(f"\n🤖 Модель: {args.model}")
-    model = load_whisper_model(args.model)
+        track_filter = parse_track_filter(args.tracks)
+        config = build_config(args, track_filter)
+        check_model_name(config.model_name)
 
-    # Обрабатываем файлы
-    results = []
-    total_files = len(input_files)
+        swears = load_swears()
+        swears_hash = compute_swears_hash(swears)
+        matcher = build_swear_matcher(swears)
 
-    for i, input_path in enumerate(input_files, 1):
+        print(f"\n🤖 Модель: {config.model_name}")
+        model = load_whisper_model(config.model_name)
+
+        file_results: list[FileResult] = []
+        total_files = len(input_files)
+        for i, input_path in enumerate(input_files, 1):
+            if total_files > 1:
+                print(f"\n{'═'*60}")
+                print(f"📂 Файл [{i}/{total_files}]: {input_path.name}")
+                print("═" * 60)
+
+            output_path = (
+                get_output_path(input_path, args.output)
+                if total_files == 1
+                else get_output_path(input_path, None)
+            )
+            media_type = probe_media_type(input_path)
+            if media_type == "audio":
+                result = process_audio_file(
+                    input_file=input_path,
+                    output_file=output_path,
+                    model=model,
+                    matcher=matcher,
+                    swears_hash=swears_hash,
+                    config=config,
+                )
+            else:
+                result = process_video_file(
+                    input_file=input_path,
+                    output_file=output_path,
+                    model=model,
+                    matcher=matcher,
+                    swears_hash=swears_hash,
+                    config=config,
+                )
+            file_results.append(result)
+
         if total_files > 1:
             print(f"\n{'═'*60}")
-            print(f"📂 Файл [{i}/{total_files}]: {input_path.name}")
-            print('═'*60)
+            print("📊 ИТОГИ:")
+            print("═" * 60)
+            for r in file_results:
+                icon = (
+                    "✅"
+                    if r.status == "ok"
+                    else ("⚠️" if r.status == "partial_failed" else "❌")
+                )
+                print(f"  {icon} {Path(r.input_path).name}: {r.status}")
 
-        # Определяем выходной путь
-        if args.output and total_files == 1:
-            output_path = Path(args.output).resolve()
-        else:
-            output_path = input_path.parent / f"{input_path.stem}_censored{input_path.suffix}"
+        report = build_run_report(file_results)
+        print(
+            f"\n📈 Всего: файлов={report['totals']['files_total']}, "
+            f"ok={report['totals']['files_ok']}, "
+            f"partial={report['totals']['files_partial_failed']}, "
+            f"failed={report['totals']['files_failed']}"
+        )
+        print(
+            f"   Матчей={report['totals']['matches_total']}, "
+            f"зацензурено={report['totals']['censored_total']}, "
+            f"время={report['totals']['duration_ms_total']/1000:.2f}s"
+        )
 
-        # Обрабатываем в зависимости от типа
-        if is_audio_file(input_path):
-            success = process_audio_file(input_path, output_path, model, swears, args.beep)
-        else:
-            success = process_video_file(input_path, output_path, model, swears,
-                                         track_filter, args.beep)
+        if config.report_json_path:
+            write_report_json(config.report_json_path, report)
 
-        results.append((input_path, success))
+        has_fail = any(r.status == "failed" for r in file_results)
+        has_partial = any(r.status == "partial_failed" for r in file_results)
+        sys.exit(1 if (has_fail or has_partial) else 0)
 
-    # Итоги при нескольких файлах
-    if total_files > 1:
-        print(f"\n{'═'*60}")
-        print("📊 ИТОГИ:")
-        print('═'*60)
-        success_count = sum(1 for _, s in results if s)
-        for path, success in results:
-            status = "✅" if success else "❌"
-            print(f"  {status} {path.name}")
-        print(f"\n  Успешно: {success_count}/{total_files}")
-
-    # Код выхода
-    all_success = all(s for _, s in results)
-    sys.exit(0 if all_success else 1)
+    except KeyboardInterrupt:
+        print("\n⛔ Остановлено пользователем (Ctrl+C). Очистка временных файлов...")
+        cleanup_temp_files()
+        sys.exit(130)
+    except CensorErrorBase as exc:
+        print(f"❌ Ошибка: {exc}")
+        sys.exit(1)
+    except Exception as exc:  # noqa: BLE001
+        print(f"❌ Непредвиденная ошибка: {type(exc).__name__}: {exc}")
+        sys.exit(1)
+    finally:
+        cleanup_temp_files()
 
 
 if __name__ == "__main__":
