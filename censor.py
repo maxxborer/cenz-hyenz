@@ -11,6 +11,7 @@
 Особенности:
 - Edge-preserve цензура: по умолчанию глушится центр слова, края остаются.
 - Режим --hard: отключает edge-preserve и использует более широкий паддинг.
+- Принимает файлы и директории: папки сканируются рекурсивно на медиафайлы.
 - Автодетект типа медиа через ffprobe (не по расширению файла).
 - Автодетект и сохранение оригинального битрейта аудио.
 - Интерактивный выбор дорожек при нескольких аудиодорожках.
@@ -53,8 +54,19 @@ if sys.platform == "win32":
     import msvcrt
 
     def _flock_exclusive(fd: Any) -> None:
-        fd.seek(0)
-        msvcrt.locking(fd.fileno(), msvcrt.LK_LOCK, 1)
+        """Блокирующий лок на Windows через polling (msvcrt.LK_NBLCK).
+
+        msvcrt.LK_LOCK делает всего ~10 попыток по 1 сек — недостаточно
+        для ожидания длинных транскрипций. Используем бесконечный poll
+        с LK_NBLCK + sleep, чтобы ждать столько, сколько нужно.
+        """
+        while True:
+            fd.seek(0)
+            try:
+                msvcrt.locking(fd.fileno(), msvcrt.LK_NBLCK, 1)
+                return
+            except OSError:
+                time.sleep(2)
 
     def _flock_try(fd: Any) -> bool:
         fd.seek(0)
@@ -88,55 +100,71 @@ else:
         fcntl.flock(fd, fcntl.LOCK_UN)
 
 
-class ResourceLock:
-    """Межпроцессный lock через файловую систему.
+class ResourceSemaphore:
+    """Межпроцессный семафор через N файловых локов.
 
-    Позволяет нескольким процессам censor.py координироваться при
-    доступе к тяжёлым ресурсам (GPU, модель Whisper). Если lock уже
-    занят другим процессом — выводит сообщение и ждёт освобождения.
+    Позволяет до ``slots`` процессам одновременно держать ресурс.
+    Процесс захватывает любой свободный слот; если все заняты —
+    ждёт (polling) освобождения любого из них.
+
+    Типичное использование: ограничить число параллельных процессов
+    censor.py, которые одновременно держат Whisper-модель в GPU.
     """
 
-    def __init__(self, name: str, label: str = "", *, enabled: bool = True):
-        self.path = CACHE_DIR / f".{name}.lock"
+    def __init__(
+        self,
+        name: str,
+        slots: int = 2,
+        label: str = "",
+        *,
+        enabled: bool = True,
+    ):
+        self.slots = max(1, slots)
         self.label = label or name
         self.enabled = enabled
+        self._slot_paths = [
+            CACHE_DIR / f".{name}_{i}.lock" for i in range(self.slots)
+        ]
         self._fd: Any = None
+        self._slot: int = -1
 
-    def __enter__(self) -> "ResourceLock":
+    def __enter__(self) -> "ResourceSemaphore":
         if not self.enabled:
             return self
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._fd = open(self.path, "w")  # noqa: SIM115
-        if not _flock_try(self._fd):
-            log(f"⏳ Ожидание: {self.label} (занят другим процессом)...")
-            _flock_exclusive(self._fd)
-            log(f"🔓 {self.label} — доступ получен")
-        return self
+        self._slot_paths[0].parent.mkdir(parents=True, exist_ok=True)
+
+        # Попытка захватить любой свободный слот (non-blocking)
+        for i, path in enumerate(self._slot_paths):
+            fd = open(path, "w")  # noqa: SIM115
+            if _flock_try(fd):
+                self._fd = fd
+                self._slot = i
+                return self
+            fd.close()
+
+        # Все слоты заняты — ждём освобождения любого
+        log(
+            f"⏳ Ожидание: {self.label} "
+            f"(все {self.slots} слот(а/ов) заняты другими процессами)..."
+        )
+        while True:
+            for i, path in enumerate(self._slot_paths):
+                fd = open(path, "w")  # noqa: SIM115
+                if _flock_try(fd):
+                    self._fd = fd
+                    self._slot = i
+                    log(f"🔓 {self.label} — слот {i} получен")
+                    return self
+                fd.close()
+            time.sleep(2)
 
     def __exit__(self, *args: Any) -> bool:
         if self._fd is not None:
             _flock_release(self._fd)
             self._fd.close()
             self._fd = None
+            self._slot = -1
         return False
-
-
-def release_gpu_cache() -> None:
-    """Попытка освободить кешированную GPU-память (CUDA).
-
-    Вызывается после завершения всех транскрипций файла, чтобы
-    другие процессы censor.py могли использовать GPU.
-    """
-    import gc
-
-    gc.collect()
-    try:
-        import torch
-
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    except ImportError:
-        pass
 
 
 # ============================================================================
@@ -180,7 +208,7 @@ CODEC_EXT_MAP = {
 SCRIPT_DIR = Path(__file__).parent
 SWEARS_FILE = SCRIPT_DIR / "swears.txt"
 SWEARS_FILE_ALT = Path.home() / ".config" / "censor" / "swears.txt"
-CACHE_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home() / ".cache")) / "censor"
+CACHE_DIR = Path.home() / ".cache" / "censor"
 
 # Глобальные кеши и временные артефакты
 _duration_cache: dict[tuple[str, int, float], float] = {}
@@ -256,7 +284,7 @@ class Config:
     verbose: bool = False
     language: str = "ru"
     report_json_path: Optional[Path] = None
-    use_process_lock: bool = True
+    max_gpu_slots: int = 2
 
 
 @dataclass
@@ -413,12 +441,52 @@ def cleanup_temp_files():
     _temp_files.clear()
 
 
+MEDIA_EXTENSIONS = AUDIO_EXTENSIONS | VIDEO_EXTENSIONS
+
+
+def is_media_file(path: Path) -> bool:
+    return path.suffix.lower() in MEDIA_EXTENSIONS
+
+
 def is_audio_file(path: Path) -> bool:
     return path.suffix.lower() in AUDIO_EXTENSIONS
 
 
 def is_video_file(path: Path) -> bool:
     return path.suffix.lower() in VIDEO_EXTENSIONS
+
+
+def collect_media_from_dir(
+    directory: Path,
+    *,
+    recursive: bool = True,
+    seen: set[Path] | None = None,
+) -> list[Path]:
+    """Собирает медиафайлы из директории (рекурсивно или нет).
+
+    Возвращает отсортированный список уникальных файлов с медиа-расширениями.
+    Скрытые директории (начинающиеся с точки) пропускаются.
+    """
+    if seen is None:
+        seen = set()
+
+    results: list[Path] = []
+    iterator = directory.rglob("*") if recursive else directory.iterdir()
+
+    for entry in sorted(iterator):
+        if not entry.is_file():
+            continue
+        # Пропускаем скрытые файлы и файлы в скрытых директориях
+        if any(part.startswith(".") for part in entry.relative_to(directory).parts):
+            continue
+        resolved = entry.resolve()
+        if resolved in seen:
+            continue
+        if is_media_file(entry):
+            seen.add(resolved)
+            results.append(resolved)
+
+    return results
 
 
 def run_cmd(
@@ -1503,17 +1571,12 @@ def process_audio_stream(
             if words is not None:
                 st.skip("cache transcript", cache_hit=True)
             else:
-                with ResourceLock(
-                    "whisper_infer",
-                    "GPU/CPU для транскрипции",
-                    enabled=config.use_process_lock,
-                ):
-                    words = transcribe(
-                        model,
-                        paths["wav_whisper"],
-                        language=config.language,
-                        show_progress=True,
-                    )
+                words = transcribe(
+                    model,
+                    paths["wav_whisper"],
+                    language=config.language,
+                    show_progress=True,
+                )
                 save_transcript_cache(paths["transcript"], words)
 
         with StepTimer(result, "match") as st:
@@ -1674,9 +1737,6 @@ def process_audio_file(
         if track_result.status == "failed":
             raise CensorErrorBase("; ".join(track_result.errors))
 
-        # Транскрипция завершена — освободить GPU-кеш для других процессов
-        release_gpu_cache()
-
         final_cache_path = Path(track_result.output_path)
         with StepTimer(file_result, "finalize-output", prefix="   "):
             shutil.copy2(final_cache_path, output_file)
@@ -1835,9 +1895,6 @@ def process_video_file(
             if track.audio_index in selected and tr.status != "fallback_copy":
                 processed_paths[track.audio_index] = track_output
 
-        # Транскрипции завершены — освободить GPU-кеш для других процессов
-        release_gpu_cache()
-
         with StepTimer(file_result, "assemble-video", prefix="   "):
             if not assemble_video(input_file, audio_files_for_mux, output_file, tracks):
                 raise AssembleError("Ошибка сборки финального видео")
@@ -1931,10 +1988,16 @@ def build_parser() -> argparse.ArgumentParser:
   %(prog)s video.mkv --report-json report.json
   %(prog)s video.mkv --info
   %(prog)s --clear-cache
+
+Директории:
+  %(prog)s ./videos/              # рекурсивно все медиа внутри
+  %(prog)s ./videos/ --no-recurse # только файлы в корне папки
+  %(prog)s ./raw/ ./extra.mkv     # папка + отдельный файл
+  %(prog)s ./dir1/ ./dir2/ --beep # несколько папок с параметрами
         """,
     )
 
-    parser.add_argument("input", nargs="*", help="Входные файлы (видео или аудио)")
+    parser.add_argument("input", nargs="*", help="Входные файлы или директории с медиа")
     parser.add_argument(
         "-o", "--output", help="Выходной файл (только для одного входного)"
     )
@@ -1976,6 +2039,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Алиас старого режима: no-edge-keep + pad=50ms",
     )
     parser.add_argument(
+        "--no-recurse",
+        action="store_true",
+        help="Не рекурсировать в поддиректории (только файлы в корне папки)",
+    )
+    parser.add_argument(
         "-v", "--verbose", action="store_true", help="Подробный вывод по этапам/матчам"
     )
     parser.add_argument("--report-json", help="Сохранить JSON-отчет в файл")
@@ -1983,9 +2051,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--language", default="ru", help="Язык транскрипции (default: ru)"
     )
     parser.add_argument(
-        "--no-lock",
-        action="store_true",
-        help="Отключить межпроцессную координацию (file locks)",
+        "--max-parallel",
+        type=int,
+        default=2,
+        help="Макс. параллельных процессов с GPU/моделью (0 = без лимита, default: 2)",
     )
     return parser
 
@@ -2033,7 +2102,7 @@ def build_config(args: argparse.Namespace, track_filter: Optional[list[int]]) ->
         verbose=args.verbose,
         language=args.language,
         report_json_path=Path(args.report_json).resolve() if args.report_json else None,
-        use_process_lock=not args.no_lock,
+        max_gpu_slots=args.max_parallel,
     )
 
     if cfg.pad_ms < 0 or cfg.edge_keep_ms < 0 or cfg.min_censor_ms < 0:
@@ -2097,22 +2166,57 @@ def main():
 
         input_files: list[Path] = []
         seen_paths: set[Path] = set()
+        skipped_dirs: list[Path] = []
+
         for pattern in args.input:
             expanded = glob.glob(pattern, recursive=True)
             if expanded:
                 for match in expanded:
                     p = Path(match).resolve()
-                    if p.is_file() and p not in seen_paths:
+                    if p.is_dir():
+                        count_before = len(input_files)
+                        found = collect_media_from_dir(
+                            p,
+                            recursive=not args.no_recurse,
+                            seen=seen_paths,
+                        )
+                        if found:
+                            input_files.extend(found)
+                            mode = "рекурсивно" if not args.no_recurse else "без рекурсии"
+                            print(
+                                f"📂 {p}: найдено {len(found)} медиафайл(ов) ({mode})"
+                            )
+                        else:
+                            skipped_dirs.append(p)
+                    elif p.is_file() and p not in seen_paths:
                         seen_paths.add(p)
                         input_files.append(p)
             else:
                 path = Path(pattern).resolve()
                 if path.exists():
-                    if path not in seen_paths:
+                    if path.is_dir():
+                        found = collect_media_from_dir(
+                            path,
+                            recursive=not args.no_recurse,
+                            seen=seen_paths,
+                        )
+                        if found:
+                            input_files.extend(found)
+                            mode = "рекурсивно" if not args.no_recurse else "без рекурсии"
+                            print(
+                                f"📂 {path}: найдено {len(found)} медиафайл(ов) ({mode})"
+                            )
+                        else:
+                            skipped_dirs.append(path)
+                    elif path not in seen_paths:
                         seen_paths.add(path)
                         input_files.append(path)
                 else:
-                    print(f"❌ Файл не найден: {path}")
+                    print(f"❌ Файл/директория не найдены: {path}")
+
+        for d in skipped_dirs:
+            print(f"⚠️  Директория не содержит медиафайлов: {d}")
+
         if not input_files:
             raise ValidationError("Нет файлов для обработки")
 
@@ -2134,46 +2238,52 @@ def main():
         matcher = build_swear_matcher(swears)
 
         print(f"\n🤖 Модель: {config.model_name}")
-        with ResourceLock(
-            "whisper_load",
-            "загрузка модели Whisper",
-            enabled=config.use_process_lock,
-        ):
+        gpu_slots = config.max_gpu_slots
+        gpu_sem = ResourceSemaphore(
+            "gpu_slot",
+            slots=gpu_slots,
+            label=f"GPU-слот (макс. {gpu_slots} параллельных)",
+            enabled=gpu_slots > 0,
+        )
+
+        # Захватываем GPU-слот ПЕРЕД загрузкой модели и держим до конца.
+        # Это гарантирует, что в GPU одновременно не более N моделей.
+        with gpu_sem:
             model = load_whisper_model(config.model_name)
 
-        file_results: list[FileResult] = []
-        total_files = len(input_files)
-        for i, input_path in enumerate(input_files, 1):
-            if total_files > 1:
-                print(f"\n{'═'*60}")
-                print(f"📂 Файл [{i}/{total_files}]: {input_path.name}")
-                print("═" * 60)
+            file_results: list[FileResult] = []
+            total_files = len(input_files)
+            for i, input_path in enumerate(input_files, 1):
+                if total_files > 1:
+                    print(f"\n{'═'*60}")
+                    print(f"📂 Файл [{i}/{total_files}]: {input_path.name}")
+                    print("═" * 60)
 
-            output_path = (
-                get_output_path(input_path, args.output)
-                if total_files == 1
-                else get_output_path(input_path, None)
-            )
-            media_type = probe_media_type(input_path)
-            if media_type == "audio":
-                result = process_audio_file(
-                    input_file=input_path,
-                    output_file=output_path,
-                    model=model,
-                    matcher=matcher,
-                    swears_hash=swears_hash,
-                    config=config,
+                output_path = (
+                    get_output_path(input_path, args.output)
+                    if total_files == 1
+                    else get_output_path(input_path, None)
                 )
-            else:
-                result = process_video_file(
-                    input_file=input_path,
-                    output_file=output_path,
-                    model=model,
-                    matcher=matcher,
-                    swears_hash=swears_hash,
-                    config=config,
-                )
-            file_results.append(result)
+                media_type = probe_media_type(input_path)
+                if media_type == "audio":
+                    result = process_audio_file(
+                        input_file=input_path,
+                        output_file=output_path,
+                        model=model,
+                        matcher=matcher,
+                        swears_hash=swears_hash,
+                        config=config,
+                    )
+                else:
+                    result = process_video_file(
+                        input_file=input_path,
+                        output_file=output_path,
+                        model=model,
+                        matcher=matcher,
+                        swears_hash=swears_hash,
+                        config=config,
+                    )
+                file_results.append(result)
 
         if total_files > 1:
             print(f"\n{'═'*60}")
