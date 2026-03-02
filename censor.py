@@ -1172,6 +1172,10 @@ def load_whisper_model(model_name: str):
     local_model_dirs = list(models_dir.glob(f"models--*--faster-whisper-{model_name}"))
     local_files_only = any(p.is_dir() for p in local_model_dirs)
     hf_token = resolve_hf_token()
+    # На Windows без Developer Mode symlink-кеш HF недоступен; отключаем шумный warning.
+    if os.name == "nt":
+        os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+
     if hf_token:
         # Дублируем в env, чтобы токен виделся внутри вызовов huggingface_hub.
         os.environ.setdefault("HF_TOKEN", hf_token)
