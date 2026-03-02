@@ -626,7 +626,7 @@ def get_audio_duration(path: Path) -> float:
     return _duration_cache[key]
 
 
-def verify_output(path: Path, label: str):
+def verify_output(path: Path, label: str, *, expect_audio: bool = False):
     if not path.exists() or path.stat().st_size <= 0:
         raise RuntimeError(f"{label}: пустой или отсутствующий файл: {path}")
     cmd = [
@@ -641,6 +641,20 @@ def verify_output(path: Path, label: str):
     result = run_cmd(cmd, capture=True)
     if result.returncode != 0:
         raise RuntimeError(f"{label}: ffprobe не смог прочитать файл: {path}")
+    if expect_audio:
+        try:
+            info = json.loads(result.stdout)
+            has_audio = any(
+                s.get("codec_type") == "audio" for s in info.get("streams", [])
+            )
+            if not has_audio:
+                raise RuntimeError(
+                    f"{label}: файл не содержит аудиостримов: {path}"
+                )
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise RuntimeError(
+                f"{label}: не удалось проверить аудиостримы: {path}"
+            ) from exc
 
 
 def check_disk_space(path: Path, required_bytes: int):
@@ -748,6 +762,39 @@ def interactive_track_selection(tracks: list[AudioTrack]) -> set[int]:
             return indices
         except ValueError as exc:
             print(f"  ⚠️  Ошибка: {exc}. Попробуйте ещё раз.")
+
+
+def export_single_track(
+    track: AudioTrack,
+    mka_path: Path,
+    output_dir: Path,
+    video_stem: str,
+) -> Optional[Path]:
+    """Экспортирует одну обработанную аудиодорожку в отдельный файл.
+
+    Выполняет ремукс из .mka в контейнер, соответствующий оригинальному
+    кодеку (AAC → .m4a, AC3 → .ac3 и т.д.) без перекодирования.
+
+    Returns:
+        Путь к экспортированному файлу или None при ошибке.
+    """
+    if not mka_path.exists():
+        return None
+    ext = CODEC_EXT_MAP.get(track.codec, ".mka")
+    out_name = f"{video_stem}_censored_track{track.audio_index}{ext}"
+    out_path = output_dir / out_name
+
+    cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-i", str(mka_path), "-c:a", "copy", str(out_path),
+    ]
+    ok = run_cmd(cmd, quiet=True).returncode == 0
+    if ok and out_path.exists():
+        sz = out_path.stat().st_size / (1024 * 1024)
+        log(f"      📤 Экспорт дорожки {track.audio_index}: {out_name} ({sz:.1f} MB)")
+        return out_path
+    print(f"      ⚠️  Не удалось экспортировать дорожку {track.audio_index}")
+    return None
 
 
 def export_separate_tracks(
@@ -1009,7 +1056,7 @@ def copy_audio_source(src: Path, output: Path, audio_index: Optional[int]) -> bo
     ]
     ok = run_cmd(cmd, quiet=True).returncode == 0
     if ok:
-        verify_output(output, "copy_audio_source(track)")
+        verify_output(output, "copy_audio_source(track)", expect_audio=True)
     return ok
 
 
@@ -1065,9 +1112,12 @@ def encode_audio(
         duration = get_audio_duration(input_wav)
         ok = run_ffmpeg_with_progress(cmd, duration, prefix)
     else:
-        ok = run_cmd(cmd, quiet=True).returncode == 0
+        result = run_cmd(cmd, capture=True)
+        ok = result.returncode == 0
+        if not ok and result.stderr:
+            log(f"      ⚠️  encode_audio stderr: {result.stderr.strip()}")
     if ok:
-        verify_output(output_file, "encode_audio")
+        verify_output(output_file, "encode_audio", expect_audio=True)
     return ok
 
 
@@ -1912,6 +1962,10 @@ def process_video_file(
                         tr.status = "copied"
                 file_result.tracks.append(tr)
                 audio_files_for_mux.append(final_track_path)
+                log(
+                    f"      ℹ️  Дорожка {track.audio_index} → mux "
+                    f"(status={tr.status}, path={final_track_path.name})"
+                )
                 continue
 
             tr = process_audio_stream(
@@ -1929,6 +1983,8 @@ def process_video_file(
             if tr.status == "failed":
                 had_track_error = True
                 print("      ⚠️  Ошибка обработки дорожки, fallback на исходную копию")
+                for err in tr.errors:
+                    print(f"          Причина: {err}")
                 add_error(tr, "fallback_to_original")
                 with StepTimer(tr, "fallback-copy"):
                     ok = copy_audio_source(
@@ -1945,23 +2001,40 @@ def process_video_file(
             file_result.total_censored += max(0, tr.censored_words)
             file_result.tracks.append(tr)
             track_output = Path(tr.output_path)
+
+            # Верификация: файл для mux реально содержит аудио
+            if not track_output.exists():
+                raise AssembleError(
+                    f"Файл дорожки {track.audio_index} не найден: {track_output}"
+                )
+            verify_output(
+                track_output,
+                f"pre-mux track {track.audio_index}",
+                expect_audio=True,
+            )
+
             audio_files_for_mux.append(track_output)
-            if track.audio_index in selected and tr.status != "fallback_copy":
+            log(
+                f"      ℹ️  Дорожка {track.audio_index} → mux "
+                f"(status={tr.status}, path={track_output.name})"
+            )
+
+            # Немедленный экспорт обработанной дорожки в финальную папку
+            if track.audio_index in selected and tr.status not in (
+                "fallback_copy",
+                "failed",
+            ):
                 processed_paths[track.audio_index] = track_output
+                ep = export_single_track(
+                    track, track_output, output_file.parent, input_file.stem
+                )
+                if ep is not None:
+                    exported.append(ep)
+                    file_result.exported_tracks.append(str(ep))
 
         with StepTimer(file_result, "assemble-video", prefix="   "):
             if not assemble_video(input_file, audio_files_for_mux, output_file, tracks):
                 raise AssembleError("Ошибка сборки финального видео")
-
-        # Экспорт отдельных обработанных аудиодорожек
-        exported: list[Path] = []
-        if processed_paths:
-            with StepTimer(file_result, "export-tracks", prefix="   "):
-                exported = export_separate_tracks(
-                    tracks, processed_paths, selected,
-                    output_file.parent, input_file.stem,
-                )
-                file_result.exported_tracks = [str(p) for p in exported]
 
         file_result.status = "partial_failed" if had_track_error else "ok"
 
