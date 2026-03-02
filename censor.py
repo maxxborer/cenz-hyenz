@@ -1125,6 +1125,41 @@ def is_silent(wav_path: Path) -> bool:
 # ============================================================================
 
 
+def resolve_hf_token() -> Optional[str]:
+    for env_name in (
+        "HF_TOKEN",
+        "HUGGINGFACE_HUB_TOKEN",
+        "HUGGING_FACE_HUB_TOKEN",
+        "HUGGINGFACE_TOKEN",
+    ):
+        token = (os.getenv(env_name) or "").strip()
+        if token:
+            return token
+
+    try:
+        from huggingface_hub import get_token as hf_get_token
+
+        token = (hf_get_token() or "").strip()
+        if token:
+            return token
+    except Exception:
+        pass
+
+    token_path_env = os.getenv("HF_TOKEN_PATH")
+    token_path = (
+        Path(token_path_env)
+        if token_path_env
+        else Path.home() / ".cache" / "huggingface" / "token"
+    )
+    try:
+        token = token_path.read_text(encoding="utf-8").strip()
+        if token:
+            return token
+    except Exception:
+        pass
+    return None
+
+
 def load_whisper_model(model_name: str):
     global WhisperModel
     if WhisperModel is None:
@@ -1134,8 +1169,16 @@ def load_whisper_model(model_name: str):
 
     models_dir = CACHE_DIR / "models"
     models_dir.mkdir(parents=True, exist_ok=True)
-    local_model = models_dir / f"models--Systran--faster-whisper-{model_name}"
-    local_files_only = local_model.exists()
+    local_model_dirs = list(models_dir.glob(f"models--*--faster-whisper-{model_name}"))
+    local_files_only = any(p.is_dir() for p in local_model_dirs)
+    hf_token = resolve_hf_token()
+    if hf_token:
+        # Дублируем в env, чтобы токен виделся внутри вызовов huggingface_hub.
+        os.environ.setdefault("HF_TOKEN", hf_token)
+        os.environ.setdefault("HUGGINGFACE_HUB_TOKEN", hf_token)
+        log("🔐 HF токен найден: запросы к HF Hub будут аутентифицированы.")
+    else:
+        log("⚠️  HF токен не найден: загрузка с HF Hub может упереться в лимиты.")
 
     attempts = [("cuda", "float16"), ("cpu", "int8")]
     last_error: Optional[Exception] = None
@@ -1152,6 +1195,7 @@ def load_whisper_model(model_name: str):
                 compute_type=compute_type,
                 download_root=str(models_dir),
                 local_files_only=local_files_only,
+                use_auth_token=hf_token,
             )
         except Exception as exc:  # noqa: BLE001
             last_error = exc
