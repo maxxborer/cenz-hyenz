@@ -46,6 +46,100 @@ WhisperModel = None
 
 
 # ============================================================================
+# МЕЖПРОЦЕССНАЯ КООРДИНАЦИЯ (file-based locking)
+# ============================================================================
+
+if sys.platform == "win32":
+    import msvcrt
+
+    def _flock_exclusive(fd: Any) -> None:
+        fd.seek(0)
+        msvcrt.locking(fd.fileno(), msvcrt.LK_LOCK, 1)
+
+    def _flock_try(fd: Any) -> bool:
+        fd.seek(0)
+        try:
+            msvcrt.locking(fd.fileno(), msvcrt.LK_NBLCK, 1)
+            return True
+        except OSError:
+            return False
+
+    def _flock_release(fd: Any) -> None:
+        fd.seek(0)
+        try:
+            msvcrt.locking(fd.fileno(), msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+
+else:
+    import fcntl
+
+    def _flock_exclusive(fd: Any) -> None:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+
+    def _flock_try(fd: Any) -> bool:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            return False
+
+    def _flock_release(fd: Any) -> None:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+class ResourceLock:
+    """Межпроцессный lock через файловую систему.
+
+    Позволяет нескольким процессам censor.py координироваться при
+    доступе к тяжёлым ресурсам (GPU, модель Whisper). Если lock уже
+    занят другим процессом — выводит сообщение и ждёт освобождения.
+    """
+
+    def __init__(self, name: str, label: str = "", *, enabled: bool = True):
+        self.path = CACHE_DIR / f".{name}.lock"
+        self.label = label or name
+        self.enabled = enabled
+        self._fd: Any = None
+
+    def __enter__(self) -> "ResourceLock":
+        if not self.enabled:
+            return self
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._fd = open(self.path, "w")  # noqa: SIM115
+        if not _flock_try(self._fd):
+            log(f"⏳ Ожидание: {self.label} (занят другим процессом)...")
+            _flock_exclusive(self._fd)
+            log(f"🔓 {self.label} — доступ получен")
+        return self
+
+    def __exit__(self, *args: Any) -> bool:
+        if self._fd is not None:
+            _flock_release(self._fd)
+            self._fd.close()
+            self._fd = None
+        return False
+
+
+def release_gpu_cache() -> None:
+    """Попытка освободить кешированную GPU-память (CUDA).
+
+    Вызывается после завершения всех транскрипций файла, чтобы
+    другие процессы censor.py могли использовать GPU.
+    """
+    import gc
+
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except ImportError:
+        pass
+
+
+# ============================================================================
 # НАСТРОЙКИ
 # ============================================================================
 
@@ -86,7 +180,7 @@ CODEC_EXT_MAP = {
 SCRIPT_DIR = Path(__file__).parent
 SWEARS_FILE = SCRIPT_DIR / "swears.txt"
 SWEARS_FILE_ALT = Path.home() / ".config" / "censor" / "swears.txt"
-CACHE_DIR = SCRIPT_DIR / "cache"
+CACHE_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home() / ".cache")) / "censor"
 
 # Глобальные кеши и временные артефакты
 _duration_cache: dict[tuple[str, int, float], float] = {}
@@ -162,6 +256,7 @@ class Config:
     verbose: bool = False
     language: str = "ru"
     report_json_path: Optional[Path] = None
+    use_process_lock: bool = True
 
 
 @dataclass
@@ -1408,12 +1503,17 @@ def process_audio_stream(
             if words is not None:
                 st.skip("cache transcript", cache_hit=True)
             else:
-                words = transcribe(
-                    model,
-                    paths["wav_whisper"],
-                    language=config.language,
-                    show_progress=True,
-                )
+                with ResourceLock(
+                    "whisper_infer",
+                    "GPU/CPU для транскрипции",
+                    enabled=config.use_process_lock,
+                ):
+                    words = transcribe(
+                        model,
+                        paths["wav_whisper"],
+                        language=config.language,
+                        show_progress=True,
+                    )
                 save_transcript_cache(paths["transcript"], words)
 
         with StepTimer(result, "match") as st:
@@ -1574,6 +1674,9 @@ def process_audio_file(
         if track_result.status == "failed":
             raise CensorErrorBase("; ".join(track_result.errors))
 
+        # Транскрипция завершена — освободить GPU-кеш для других процессов
+        release_gpu_cache()
+
         final_cache_path = Path(track_result.output_path)
         with StepTimer(file_result, "finalize-output", prefix="   "):
             shutil.copy2(final_cache_path, output_file)
@@ -1732,6 +1835,9 @@ def process_video_file(
             if track.audio_index in selected and tr.status != "fallback_copy":
                 processed_paths[track.audio_index] = track_output
 
+        # Транскрипции завершены — освободить GPU-кеш для других процессов
+        release_gpu_cache()
+
         with StepTimer(file_result, "assemble-video", prefix="   "):
             if not assemble_video(input_file, audio_files_for_mux, output_file, tracks):
                 raise AssembleError("Ошибка сборки финального видео")
@@ -1876,6 +1982,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--language", default="ru", help="Язык транскрипции (default: ru)"
     )
+    parser.add_argument(
+        "--no-lock",
+        action="store_true",
+        help="Отключить межпроцессную координацию (file locks)",
+    )
     return parser
 
 
@@ -1922,6 +2033,7 @@ def build_config(args: argparse.Namespace, track_filter: Optional[list[int]]) ->
         verbose=args.verbose,
         language=args.language,
         report_json_path=Path(args.report_json).resolve() if args.report_json else None,
+        use_process_lock=not args.no_lock,
     )
 
     if cfg.pad_ms < 0 or cfg.edge_keep_ms < 0 or cfg.min_censor_ms < 0:
@@ -2022,7 +2134,12 @@ def main():
         matcher = build_swear_matcher(swears)
 
         print(f"\n🤖 Модель: {config.model_name}")
-        model = load_whisper_model(config.model_name)
+        with ResourceLock(
+            "whisper_load",
+            "загрузка модели Whisper",
+            enabled=config.use_process_lock,
+        ):
+            model = load_whisper_model(config.model_name)
 
         file_results: list[FileResult] = []
         total_files = len(input_files)
