@@ -171,7 +171,7 @@ class ResourceSemaphore:
 # НАСТРОЙКИ
 # ============================================================================
 
-DEFAULT_MODEL = "medium"
+DEFAULT_MODEL = "large-v3-turbo"
 KNOWN_MODELS = frozenset(
     {
         "tiny",
