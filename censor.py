@@ -455,6 +455,12 @@ def is_audio_file(path: Path) -> bool:
 def is_video_file(path: Path) -> bool:
     return path.suffix.lower() in VIDEO_EXTENSIONS
 
+_CENSOR_SUFFIX_RE = re.compile(r"_censored(_track\d+)?$")
+
+def _is_censor_output(path: Path) -> bool:
+    """Файл — результат предыдущего запуска censor.py."""
+    return _CENSOR_SUFFIX_RE.search(path.stem) is not None
+
 
 def collect_media_from_dir(
     directory: Path,
@@ -482,7 +488,7 @@ def collect_media_from_dir(
         resolved = entry.resolve()
         if resolved in seen:
             continue
-        if is_media_file(entry):
+        if is_media_file(entry) and not _is_censor_output(entry):
             seen.add(resolved)
             results.append(resolved)
 
