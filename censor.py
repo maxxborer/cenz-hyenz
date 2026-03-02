@@ -187,11 +187,11 @@ KNOWN_MODELS = frozenset(
 SILENCE_THRESHOLD_DB = -50
 BEEP_FREQ = 1000  # Гц
 
-DEFAULT_PAD_MS = 25
-HARD_PAD_MS = 50
+DEFAULT_PAD_MS = 15
+HARD_PAD_MS = 30
 DEFAULT_EDGE_KEEP_MS = 15
-DEFAULT_MIN_CENSOR_MS = 80
-MERGE_GAP_MS = 40
+DEFAULT_MIN_CENSOR_MS = 75
+MERGE_GAP_MS = 50
 
 # Расширения файлов (для совместимости и output-хинтов)
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac", ".wma", ".opus"}
