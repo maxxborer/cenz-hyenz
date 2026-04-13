@@ -281,6 +281,7 @@ class Config:
     edge_keep_enabled: bool = True
     min_censor_ms: int = DEFAULT_MIN_CENSOR_MS
     track_filter: Optional[list[int]] = None
+    censored_tracks_only: bool = False
     verbose: bool = False
     language: str = "ru"
     report_json_path: Optional[Path] = None
@@ -321,7 +322,7 @@ class StageResult:
 class TrackResult:
     track_index: Optional[int]
     title: str
-    status: str = "pending"  # ok|cached|failed|fallback_copy|copied
+    status: str = "pending"  # ok|cached|failed|fallback_copy|copied|skipped
     found_matches: int = 0
     applied_intervals: int = 0
     censored_words: int = 0
@@ -336,7 +337,7 @@ class FileResult:
     input_path: str
     output_path: str
     media_type: str
-    status: str = "pending"  # ok|partial_failed|failed
+    status: str = "pending"  # ok|partial_failed|failed|skipped
     total_matches: int = 0
     total_censored: int = 0
     duration_ms: float = 0.0
@@ -585,6 +586,7 @@ def compute_config_signature(config: Config, swears_hash: str) -> str:
         "edge_keep_ms": config.edge_keep_ms,
         "edge_keep_enabled": config.edge_keep_enabled,
         "min_censor_ms": config.min_censor_ms,
+        "censored_tracks_only": config.censored_tracks_only,
         "language": config.language,
         "swears": swears_hash,
     }
@@ -1664,6 +1666,10 @@ def process_audio_stream(
                 silent = True
 
         if silent:
+            if config.censored_tracks_only:
+                result.status = "skipped"
+                result.output_path = ""
+                return result
             with StepTimer(result, "copy-silent-original"):
                 if not copy_audio_source(source_file, paths["final"], audio_index):
                     raise EncodeError("Не удалось скопировать тихий исходный аудиопоток")
@@ -1701,6 +1707,10 @@ def process_audio_stream(
                 st.skip("no-matches")
 
         if not intervals:
+            if config.censored_tracks_only:
+                result.status = "skipped"
+                result.output_path = ""
+                return result
             with StepTimer(result, "copy-original"):
                 if not copy_audio_source(source_file, paths["final"], audio_index):
                     raise EncodeError("Не удалось скопировать исходный аудиопоток")
@@ -1807,7 +1817,7 @@ def process_audio_file(
     """
     file_result = FileResult(
         input_path=str(input_file),
-        output_path=str(output_file),
+        output_path="",
         media_type="audio",
     )
     file_start = time.monotonic()
@@ -1841,14 +1851,17 @@ def process_audio_file(
         if track_result.status == "failed":
             raise CensorErrorBase("; ".join(track_result.errors))
 
-        final_cache_path = Path(track_result.output_path)
-        with StepTimer(file_result, "finalize-output", prefix="   "):
-            shutil.copy2(final_cache_path, output_file)
-            verify_output(output_file, "final output audio")
-
         file_result.total_matches = max(0, track_result.found_matches)
         file_result.total_censored = max(0, track_result.censored_words)
-        file_result.status = "ok"
+        if track_result.status == "skipped":
+            file_result.status = "skipped"
+        else:
+            final_cache_path = Path(track_result.output_path)
+            with StepTimer(file_result, "finalize-output", prefix="   "):
+                shutil.copy2(final_cache_path, output_file)
+                verify_output(output_file, "final output audio")
+            file_result.output_path = str(output_file)
+            file_result.status = "ok"
 
     except Exception as exc:  # noqa: BLE001
         file_result.status = "failed"
@@ -1863,6 +1876,9 @@ def process_audio_file(
         print(
             f"   Найдено: {file_result.total_matches}, зацензурено: {file_result.total_censored}"
         )
+    elif file_result.status == "skipped":
+        print(f"⏭️  Пропущено: {input_file.name}")
+        print("   Нет дорожек, которые нужно было бы зацензурить, выходной файл не создан")
     else:
         print(f"❌ Ошибка аудиофайла: {input_file.name}")
         for e in file_result.errors:
@@ -1881,12 +1897,13 @@ def process_video_file(
     """Обрабатывает видеофайл: извлечение дорожек → цензура → сборка.
 
     Если дорожек >1 и -t не указан — интерактивный выбор в терминале.
-    После сборки видео экспортирует обработанные дорожки отдельными файлами.
-    Вывод: «Было» (оригинал), «Стало» (видео), «Стало 2» (отдельные дорожки).
+    В обычном режиме после сборки видео экспортирует обработанные дорожки
+    отдельными файлами. В режиме --censored-tracks-only сборка видео пропускается
+    и сохраняются только дорожки, где реально нашлись и были зацензурены маты.
     """
     file_result = FileResult(
         input_path=str(input_file),
-        output_path=str(output_file),
+        output_path="",
         media_type="video",
     )
     file_start = time.monotonic()
@@ -1894,7 +1911,10 @@ def process_video_file(
     exported: list[Path] = []
 
     print(f"\n🎬 Вход:  {input_file}")
-    print(f"📁 Выход: {output_file}")
+    if config.censored_tracks_only:
+        print(f"📁 Выход: {output_file} (сборка видео отключена)")
+    else:
+        print(f"📁 Выход: {output_file}")
 
     try:
         with StepTimer(file_result, "probe-video", prefix="   "):
@@ -1934,127 +1954,218 @@ def process_video_file(
             preextract_whisper_tracks(input_file, selected_tracks, cache_dir)
             st.info(f"tracks={len(selected_tracks)}")
 
-        audio_files_for_mux: list[Path] = []
-        processed_paths: dict[int, Path] = {}
-        for i, track in enumerate(tracks, 1):
-            print(f"\n{'─'*56}")
-            print(f"🎵 [{i}/{len(tracks)}] Дорожка {track.audio_index}: {track.title}")
-            final_track_path = cache_dir / f"track_{track.audio_index}_final.mka"
+        if config.censored_tracks_only:
+            for i, track in enumerate(tracks, 1):
+                print(f"\n{'─'*56}")
+                print(f"🎵 [{i}/{len(tracks)}] Дорожка {track.audio_index}: {track.title}")
 
-            if track.audio_index not in selected:
-                tr = TrackResult(
-                    track_index=track.audio_index,
-                    title=track.title,
-                    output_path=str(final_track_path),
-                )
-                with StepTimer(tr, "copy-unselected") as st:
-                    if final_track_path.exists():
-                        tr.status = "cached"
-                        st.skip("cache", cache_hit=True)
-                    else:
-                        ok = copy_audio_source(
-                            input_file, final_track_path, track.audio_index
-                        )
-                        if not ok:
-                            raise EncodeError(
-                                "Не удалось скопировать невыбранную дорожку"
-                            )
-                        tr.status = "copied"
-                file_result.tracks.append(tr)
-                audio_files_for_mux.append(final_track_path)
-                log(
-                    f"      ℹ️  Дорожка {track.audio_index} → mux "
-                    f"(status={tr.status}, path={final_track_path.name})"
-                )
-                continue
-
-            tr = process_audio_stream(
-                model=model,
-                source_file=input_file,
-                audio_index=track.audio_index,
-                track_info=track,
-                cache_dir=cache_dir,
-                matcher=matcher,
-                config=config,
-                final_ext=".mka",
-                preextracted_whisper=cache_dir / f"track_{track.audio_index}_16k.wav",
-            )
-
-            if tr.status == "failed":
-                had_track_error = True
-                print("      ⚠️  Ошибка обработки дорожки, fallback на исходную копию")
-                for err in tr.errors:
-                    print(f"          Причина: {err}")
-                add_error(tr, "fallback_to_original")
-                with StepTimer(tr, "fallback-copy"):
-                    ok = copy_audio_source(
-                        input_file, final_track_path, track.audio_index
+                if track.audio_index not in selected:
+                    tr = TrackResult(
+                        track_index=track.audio_index,
+                        title=track.title,
+                        status="skipped",
                     )
-                    if not ok:
-                        raise EncodeError(
-                            f"Fallback copy не удался для дорожки {track.audio_index}"
-                        )
-                tr.status = "fallback_copy"
-                tr.output_path = str(final_track_path)
+                    file_result.tracks.append(tr)
+                    log(
+                        f"      ℹ️  Дорожка {track.audio_index} пропущена "
+                        f"(режим только зацензуренных дорожек)"
+                    )
+                    continue
 
-            file_result.total_matches += max(0, tr.found_matches)
-            file_result.total_censored += max(0, tr.censored_words)
-            file_result.tracks.append(tr)
-            track_output = Path(tr.output_path)
-
-            # Верификация: файл для mux реально содержит аудио
-            if not track_output.exists():
-                raise AssembleError(
-                    f"Файл дорожки {track.audio_index} не найден: {track_output}"
+                tr = process_audio_stream(
+                    model=model,
+                    source_file=input_file,
+                    audio_index=track.audio_index,
+                    track_info=track,
+                    cache_dir=cache_dir,
+                    matcher=matcher,
+                    config=config,
+                    final_ext=".mka",
+                    preextracted_whisper=cache_dir / f"track_{track.audio_index}_16k.wav",
                 )
-            verify_output(
-                track_output,
-                f"pre-mux track {track.audio_index}",
-                expect_audio=True,
-            )
 
-            audio_files_for_mux.append(track_output)
-            log(
-                f"      ℹ️  Дорожка {track.audio_index} → mux "
-                f"(status={tr.status}, path={track_output.name})"
-            )
+                if tr.status == "failed":
+                    had_track_error = True
+                    print(
+                        "      ⚠️  Ошибка обработки дорожки, "
+                        "пропускаю её (режим только зацензуренных дорожек)"
+                    )
+                    for err in tr.errors:
+                        print(f"          Причина: {err}")
+                    tr.output_path = ""
+                    file_result.tracks.append(tr)
+                    continue
 
-            # Немедленный экспорт обработанной дорожки в финальную папку
-            if track.audio_index in selected and tr.status not in (
-                "fallback_copy",
-                "failed",
-            ):
-                processed_paths[track.audio_index] = track_output
+                if tr.status == "skipped":
+                    file_result.total_matches += max(0, tr.found_matches)
+                    file_result.total_censored += max(0, tr.censored_words)
+                    file_result.tracks.append(tr)
+                    log(
+                        f"      ℹ️  Дорожка {track.audio_index} пропущена "
+                        f"(не требует цензуры или тихая)"
+                    )
+                    continue
+
+                file_result.total_matches += max(0, tr.found_matches)
+                file_result.total_censored += max(0, tr.censored_words)
+                file_result.tracks.append(tr)
+                track_output = Path(tr.output_path)
+
+                # Верификация: файл для экспорта реально содержит аудио
+                if not track_output.exists():
+                    raise AssembleError(
+                        f"Файл дорожки {track.audio_index} не найден: {track_output}"
+                    )
+                verify_output(
+                    track_output,
+                    f"pre-export track {track.audio_index}",
+                    expect_audio=True,
+                )
+
                 ep = export_single_track(
                     track, track_output, output_file.parent, input_file.stem
                 )
                 if ep is not None:
                     exported.append(ep)
                     file_result.exported_tracks.append(str(ep))
+                    log(
+                        f"      ℹ️  Дорожка {track.audio_index} → export "
+                        f"(status={tr.status}, path={ep.name})"
+                    )
+                else:
+                    had_track_error = True
 
-        with StepTimer(file_result, "assemble-video", prefix="   "):
-            if not assemble_video(input_file, audio_files_for_mux, output_file, tracks):
-                raise AssembleError("Ошибка сборки финального видео")
+            file_result.status = (
+                "partial_failed"
+                if had_track_error
+                else ("ok" if exported else "skipped")
+            )
+        else:
+            audio_files_for_mux: list[Path] = []
+            for i, track in enumerate(tracks, 1):
+                print(f"\n{'─'*56}")
+                print(f"🎵 [{i}/{len(tracks)}] Дорожка {track.audio_index}: {track.title}")
+                final_track_path = cache_dir / f"track_{track.audio_index}_final.mka"
 
-        file_result.status = "partial_failed" if had_track_error else "ok"
+                if track.audio_index not in selected:
+                    tr = TrackResult(
+                        track_index=track.audio_index,
+                        title=track.title,
+                        output_path=str(final_track_path),
+                    )
+                    with StepTimer(tr, "copy-unselected") as st:
+                        if final_track_path.exists():
+                            tr.status = "cached"
+                            st.skip("cache", cache_hit=True)
+                        else:
+                            ok = copy_audio_source(
+                                input_file, final_track_path, track.audio_index
+                            )
+                            if not ok:
+                                raise EncodeError(
+                                    "Не удалось скопировать невыбранную дорожку"
+                                )
+                            tr.status = "copied"
+                    file_result.tracks.append(tr)
+                    audio_files_for_mux.append(final_track_path)
+                    log(
+                        f"      ℹ️  Дорожка {track.audio_index} → mux "
+                        f"(status={tr.status}, path={final_track_path.name})"
+                    )
+                    continue
+
+                tr = process_audio_stream(
+                    model=model,
+                    source_file=input_file,
+                    audio_index=track.audio_index,
+                    track_info=track,
+                    cache_dir=cache_dir,
+                    matcher=matcher,
+                    config=config,
+                    final_ext=".mka",
+                    preextracted_whisper=cache_dir / f"track_{track.audio_index}_16k.wav",
+                )
+
+                if tr.status == "failed":
+                    had_track_error = True
+                    print("      ⚠️  Ошибка обработки дорожки, fallback на исходную копию")
+                    for err in tr.errors:
+                        print(f"          Причина: {err}")
+                    add_error(tr, "fallback_to_original")
+                    with StepTimer(tr, "fallback-copy"):
+                        ok = copy_audio_source(
+                            input_file, final_track_path, track.audio_index
+                        )
+                        if not ok:
+                            raise EncodeError(
+                                f"Fallback copy не удался для дорожки {track.audio_index}"
+                            )
+                    tr.status = "fallback_copy"
+                    tr.output_path = str(final_track_path)
+
+                file_result.total_matches += max(0, tr.found_matches)
+                file_result.total_censored += max(0, tr.censored_words)
+                file_result.tracks.append(tr)
+                track_output = Path(tr.output_path)
+
+                # Верификация: файл для mux реально содержит аудио
+                if not track_output.exists():
+                    raise AssembleError(
+                        f"Файл дорожки {track.audio_index} не найден: {track_output}"
+                    )
+                verify_output(
+                    track_output,
+                    f"pre-mux track {track.audio_index}",
+                    expect_audio=True,
+                )
+
+                audio_files_for_mux.append(track_output)
+                log(
+                    f"      ℹ️  Дорожка {track.audio_index} → mux "
+                    f"(status={tr.status}, path={track_output.name})"
+                )
+
+                # Немедленный экспорт обработанной дорожки в финальную папку
+                if track.audio_index in selected and tr.status not in (
+                    "fallback_copy",
+                    "failed",
+                ):
+                    ep = export_single_track(
+                        track, track_output, output_file.parent, input_file.stem
+                    )
+                    if ep is not None:
+                        exported.append(ep)
+                        file_result.exported_tracks.append(str(ep))
+
+            with StepTimer(file_result, "assemble-video", prefix="   "):
+                if not assemble_video(input_file, audio_files_for_mux, output_file, tracks):
+                    raise AssembleError("Ошибка сборки финального видео")
+
+            file_result.output_path = str(output_file)
+            file_result.status = "partial_failed" if had_track_error else "ok"
 
     except Exception as exc:  # noqa: BLE001
         file_result.status = "failed"
         add_error(file_result, f"{type(exc).__name__}: {exc}")
 
     file_result.duration_ms = (time.monotonic() - file_start) * 1000.0
-    if file_result.status in {"ok", "partial_failed"}:
-        size_mb = (
-            output_file.stat().st_size / (1024 * 1024) if output_file.exists() else 0.0
-        )
+    if file_result.status in {"ok", "partial_failed", "skipped"}:
         print(f"\n{'═'*56}")
         print(f"  Было:    {input_file}")
-        print(f"  Стало:   {output_file} ({size_mb:.1f} MB)")
+        if config.censored_tracks_only:
+            print("  Стало:   видео не собиралось (--censored-tracks-only)")
+        elif output_file.exists():
+            size_mb = output_file.stat().st_size / (1024 * 1024)
+            print(f"  Стало:   {output_file} ({size_mb:.1f} MB)")
+        else:
+            print("  Стало:   выходное видео не создано")
         if exported:
             print("  Стало 2: Отдельные дорожки:")
             for ep in exported:
                 sz = ep.stat().st_size / (1024 * 1024)
                 print(f"           {ep.name} ({sz:.1f} MB)")
+        elif config.censored_tracks_only:
+            print("  Стало 2:  нет зацензуренных дорожек")
         print(f"{'═'*56}")
         print(
             f"   Найдено: {file_result.total_matches}, "
@@ -2080,6 +2191,7 @@ def build_run_report(file_results: list[FileResult]) -> dict[str, Any]:
         "files_partial_failed": sum(
             1 for r in file_results if r.status == "partial_failed"
         ),
+        "files_skipped": sum(1 for r in file_results if r.status == "skipped"),
         "files_failed": sum(1 for r in file_results if r.status == "failed"),
         "matches_total": sum(r.total_matches for r in file_results),
         "censored_total": sum(r.total_censored for r in file_results),
@@ -2112,6 +2224,7 @@ def build_parser() -> argparse.ArgumentParser:
   %(prog)s video.mkv --hard
   %(prog)s video.mkv --pad-ms 20 --edge-keep-ms 15
   %(prog)s video.mkv -t 0,2
+  %(prog)s video.mkv --censored-tracks-only
   %(prog)s video.mkv --report-json report.json
   %(prog)s video.mkv --info
   %(prog)s --clear-cache
@@ -2164,6 +2277,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--hard",
         action="store_true",
         help="Алиас старого режима: no-edge-keep + pad=50ms",
+    )
+    parser.add_argument(
+        "--censored-tracks-only",
+        "--tracks-only",
+        dest="censored_tracks_only",
+        action="store_true",
+        help="Не собирать видео; сохранять только зацензуренные дорожки",
     )
     parser.add_argument(
         "--no-recurse",
@@ -2226,6 +2346,7 @@ def build_config(args: argparse.Namespace, track_filter: Optional[list[int]]) ->
         edge_keep_enabled=edge_keep_enabled,
         min_censor_ms=args.min_censor_ms,
         track_filter=track_filter,
+        censored_tracks_only=args.censored_tracks_only,
         verbose=args.verbose,
         language=args.language,
         report_json_path=Path(args.report_json).resolve() if args.report_json else None,
@@ -2420,7 +2541,11 @@ def main():
                 icon = (
                     "✅"
                     if r.status == "ok"
-                    else ("⚠️" if r.status == "partial_failed" else "❌")
+                    else (
+                        "⚠️"
+                        if r.status == "partial_failed"
+                        else ("⏭️" if r.status == "skipped" else "❌")
+                    )
                 )
                 print(f"  {icon} {Path(r.input_path).name}: {r.status}")
 
@@ -2429,6 +2554,7 @@ def main():
             f"\n📈 Всего: файлов={report['totals']['files_total']}, "
             f"ok={report['totals']['files_ok']}, "
             f"partial={report['totals']['files_partial_failed']}, "
+            f"skipped={report['totals']['files_skipped']}, "
             f"failed={report['totals']['files_failed']}"
         )
         print(
