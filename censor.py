@@ -281,6 +281,7 @@ class Config:
     edge_keep_enabled: bool = True
     min_censor_ms: int = DEFAULT_MIN_CENSOR_MS
     track_filter: Optional[list[int]] = None
+    all_tracks: bool = False
     censored_tracks_only: bool = False
     verbose: bool = False
     language: str = "ru"
@@ -578,7 +579,9 @@ def compute_swears_hash(swears: set[str]) -> str:
     return hashlib.md5(data).hexdigest()[:10]
 
 
-def compute_config_signature(config: Config, swears_hash: str) -> str:
+def compute_config_signature(
+    config: Config, swears_hash: str, selection_signature: str = ""
+) -> str:
     payload = {
         "model": config.model_name,
         "beep": config.use_beep,
@@ -586,6 +589,7 @@ def compute_config_signature(config: Config, swears_hash: str) -> str:
         "edge_keep_ms": config.edge_keep_ms,
         "edge_keep_enabled": config.edge_keep_enabled,
         "min_censor_ms": config.min_censor_ms,
+        "selection": selection_signature,
         "censored_tracks_only": config.censored_tracks_only,
         "language": config.language,
         "swears": swears_hash,
@@ -595,10 +599,10 @@ def compute_config_signature(config: Config, swears_hash: str) -> str:
 
 
 def get_processing_cache_dir(
-    input_file: Path, config: Config, swears_hash: str
+    input_file: Path, config: Config, swears_hash: str, selection_signature: str = ""
 ) -> Path:
     base = get_cache_dir(input_file)
-    signature = compute_config_signature(config, swears_hash)
+    signature = compute_config_signature(config, swears_hash, selection_signature)
     run_dir = base / f"run_{signature}"
     run_dir.mkdir(parents=True, exist_ok=True)
     return run_dir
@@ -1831,7 +1835,9 @@ def process_audio_file(
             if not audio_info:
                 raise ProbeError("Не удалось прочитать аудиофайл")
 
-        cache_dir = get_processing_cache_dir(input_file, config, swears_hash)
+        cache_dir = get_processing_cache_dir(
+            input_file, config, swears_hash, selection_signature="audio"
+        )
         log(f"💾 Кеш: {cache_dir}")
         print(
             f"📊 {audio_info.codec}, {audio_info.channels}ch, {audio_info.sample_rate}Hz"
@@ -1923,7 +1929,9 @@ def process_video_file(
                 raise ProbeError("Аудиодорожки не найдены")
 
         available = {t.audio_index for t in tracks}
-        if config.track_filter is not None:
+        if config.all_tracks:
+            selected = available
+        elif config.track_filter is not None:
             missing = [x for x in config.track_filter if x not in available]
             if missing:
                 raise ValidationError(f"Нет дорожек с индексами: {missing}")
@@ -1935,7 +1943,7 @@ def process_video_file(
 
         # interactive_track_selection уже показывает список дорожек,
         # поэтому выводим только когда выбор был неинтерактивным
-        if config.track_filter is not None or len(tracks) == 1:
+        if config.track_filter is not None or config.all_tracks or len(tracks) == 1:
             print(f"\n📊 Аудиодорожек: {len(tracks)}")
             for t in tracks:
                 br = f", {format_bitrate(t.bitrate)}" if t.bitrate else ""
@@ -1946,7 +1954,10 @@ def process_video_file(
                 )
         print(f"\n⚙️  Обработка дорожек: {sorted(selected)}")
 
-        cache_dir = get_processing_cache_dir(input_file, config, swears_hash)
+        selection_signature = ",".join(str(idx) for idx in sorted(selected))
+        cache_dir = get_processing_cache_dir(
+            input_file, config, swears_hash, selection_signature=selection_signature
+        )
         log(f"💾 Кеш: {cache_dir}")
 
         with StepTimer(file_result, "preextract-whisper", prefix="   ") as st:
@@ -2224,6 +2235,8 @@ def build_parser() -> argparse.ArgumentParser:
   %(prog)s video.mkv --hard
   %(prog)s video.mkv --pad-ms 20 --edge-keep-ms 15
   %(prog)s video.mkv -t 0,2
+  %(prog)s video.mkv -a
+  %(prog)s video.mkv --all-tracks
   %(prog)s video.mkv --censored-tracks-only
   %(prog)s video.mkv --report-json report.json
   %(prog)s video.mkv --info
@@ -2247,7 +2260,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_MODEL,
         help=f"Модель Whisper (default: {DEFAULT_MODEL})",
     )
-    parser.add_argument("-t", "--tracks", help="Дорожки для видео, например: 0,2,4")
+    track_group = parser.add_mutually_exclusive_group()
+    track_group.add_argument(
+        "-t",
+        "--tracks",
+        help="Дорожки для видео, например: 0,2,4",
+    )
+    track_group.add_argument(
+        "-a",
+        "--all-tracks",
+        action="store_true",
+        help="Автоматически выбрать все доступные дорожки",
+    )
     parser.add_argument("--beep", action="store_true", help="Бип вместо тишины")
     parser.add_argument("--info", action="store_true", help="Показать дорожки")
     parser.add_argument(
@@ -2346,6 +2370,7 @@ def build_config(args: argparse.Namespace, track_filter: Optional[list[int]]) ->
         edge_keep_enabled=edge_keep_enabled,
         min_censor_ms=args.min_censor_ms,
         track_filter=track_filter,
+        all_tracks=args.all_tracks,
         censored_tracks_only=args.censored_tracks_only,
         verbose=args.verbose,
         language=args.language,
